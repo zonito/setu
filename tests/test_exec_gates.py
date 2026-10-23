@@ -941,6 +941,22 @@ class RunawayBrakeTests(unittest.TestCase):
             self.assertEqual(kinds, ["placing", "would_place"])
 
 
+class StubOpener:
+    """Stands in for the notify opener: records requests, returns a
+    canned response or raises a canned error."""
+
+    def __init__(self, resp=None, exc=None):
+        self.resp = resp
+        self.exc = exc
+        self.requests = []
+
+    def open(self, req, timeout=None):
+        self.requests.append(req)
+        if self.exc is not None:
+            raise self.exc
+        return self.resp
+
+
 class PushoverTests(unittest.TestCase):
     """Item 5: live mode notifies placements and gate refusals via
     Varuna's Pushover route; simulate never notifies; a failed
@@ -969,14 +985,13 @@ class PushoverTests(unittest.TestCase):
     def test_failed_notify_is_swallowed(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_cfg(tmp)
-            with mock.patch.object(setu_exec.urllib.request, "urlopen",
-                                   side_effect=OSError("down")):
+            stub = StubOpener(exc=OSError("down"))
+            with mock.patch.object(setu_exec, "_NOTIFY_OPENER", stub):
                 self.assertFalse(setu_exec.send_pushover(cfg, "T", "M"))
 
     def test_successful_notify_posts_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_cfg(tmp)
-            captured = {}
 
             class Resp:
                 def __enter__(self):
@@ -988,17 +1003,89 @@ class PushoverTests(unittest.TestCase):
                 def read(self):
                     return b"{}"
 
-            def fake_urlopen(req, timeout=None):
-                captured["url"] = req.full_url
-                captured["body"] = json.loads(req.data.decode())
-                captured["source"] = req.get_header("X-varuna-source")
-                return Resp()
-
-            with mock.patch.object(setu_exec.urllib.request, "urlopen",
-                                   fake_urlopen):
+            stub = StubOpener(resp=Resp())
+            with mock.patch.object(setu_exec, "_NOTIFY_OPENER", stub):
                 self.assertTrue(setu_exec.send_pushover(cfg, "T", "M"))
-            self.assertEqual(captured["body"]["priority"], 1)
-            self.assertEqual(captured["source"], "Molang")
+            req = stub.requests[0]
+            self.assertEqual(json.loads(req.data.decode())["priority"], 1)
+            self.assertEqual(req.get_header("X-varuna-source"), "Molang")
+
+    def test_notify_opener_ignores_environment_proxies(self):
+        """Regression (v0.2.2): the v0.2.1 notify went through the
+        default urlopen, which honoured proxy settings inherited
+        from the process environment and got fenced (HTTP 403) on
+        Nikhila's machine while the direct Kubera posts beside it
+        succeeded. The dedicated opener's ProxyHandler map must be
+        explicitly empty even with the environment poisoned, so
+        the environment is never consulted."""
+        hits = []
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/ping"
+            poison = {"http_proxy": "http://127.0.0.1:1",
+                      "HTTP_PROXY": "http://127.0.0.1:1",
+                      "https_proxy": "http://127.0.0.1:1",
+                      "HTTPS_PROXY": "http://127.0.0.1:1",
+                      "no_proxy": "", "NO_PROXY": ""}
+            with mock.patch.dict(os.environ, poison):
+                # Sanity: the environment really would hand out the
+                # unroutable proxy, and an opener that reads the
+                # environment (the old notify path) really is fenced.
+                self.assertEqual(
+                    setu_exec.urllib.request.getproxies().get("http"),
+                    "http://127.0.0.1:1")
+                env_opener = setu_exec.urllib.request.build_opener(
+                    setu_exec.urllib.request.ProxyHandler())
+                with self.assertRaises(Exception):
+                    env_opener.open(url, timeout=3)
+                # The dedicated opener goes direct regardless.
+                with setu_exec._direct_opener().open(url, timeout=3) as resp:
+                    self.assertEqual(resp.read(), b"ok")
+            self.assertEqual(hits, ["/ping"])
+        finally:
+            server.shutdown()
+
+    def test_notify_uses_direct_opener_not_urlopen(self):
+        """With the environment poisoned and urlopen rigged to
+        explode, send_pushover must still go out through the
+        module's direct opener, request unchanged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+
+            class Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    return b"{}"
+
+            stub = StubOpener(resp=Resp())
+            poison = {"http_proxy": "http://127.0.0.1:1",
+                      "HTTP_PROXY": "http://127.0.0.1:1"}
+            with mock.patch.dict(os.environ, poison), \
+                    mock.patch.object(setu_exec, "_NOTIFY_OPENER", stub), \
+                    mock.patch.object(
+                        setu_exec.urllib.request, "urlopen",
+                        side_effect=AssertionError("urlopen must not be used")):
+                self.assertTrue(setu_exec.send_pushover(cfg, "T", "M"))
+            self.assertEqual(len(stub.requests), 1)
 
     def test_live_placement_notifies(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1132,6 +1219,132 @@ class PostureLineTests(unittest.TestCase):
             self.assertIn("armed=True", posture[0])
             self.assertIn("kill_switch=False", posture[0])
             self.assertIn("placements_today=0", posture[0])
+
+
+class RotatingLogSinkTests(unittest.TestCase):
+    """v0.2.2: the daemon log is bounded — copytruncate rotation at
+    the configured size, a fixed backup count, no line lost or
+    duplicated at a rotation seam, same inode throughout."""
+
+    def _sink(self, tmp, max_bytes=120, backups=3):
+        return setu_exec.RotatingLogSink(Path(tmp) / "prog.log",
+                                         max_bytes=max_bytes,
+                                         backups=backups)
+
+    def _all_lines(self, tmp):
+        base = Path(tmp) / "prog.log"
+        out = []
+        for n in (3, 2, 1):
+            b = base.with_name(base.name + f".{n}")
+            if b.exists():
+                out += b.read_text(encoding="utf-8").splitlines()
+        out += base.read_text(encoding="utf-8").splitlines()
+        return out
+
+    def test_rotation_bounds_and_backup_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = self._sink(tmp)
+            for i in range(200):
+                sink.write(f"L{i:03d}")
+            base = Path(tmp) / "prog.log"
+            names = sorted(p.name for p in Path(tmp).iterdir())
+            self.assertEqual(names, ["prog.log", "prog.log.1",
+                                     "prog.log.2", "prog.log.3"])
+            for p in Path(tmp).iterdir():
+                self.assertLessEqual(p.stat().st_size, 120)
+            total = sum(p.stat().st_size for p in Path(tmp).iterdir())
+            self.assertLessEqual(total, 4 * 120)
+
+    def test_no_line_lost_or_duplicated_across_rotations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = self._sink(tmp)  # 120 B/file, 5 B/line -> 24 per file
+            for i in range(60):
+                sink.write(f"L{i:03d}")
+            self.assertEqual(self._all_lines(tmp),
+                             [f"L{i:03d}" for i in range(60)])
+
+    def test_live_path_keeps_its_inode(self):
+        """copytruncate, never rename: `tail -f` on the live path
+        follows the fd, so the inode must survive rotations."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = self._sink(tmp)
+            ino = os.stat(Path(tmp) / "prog.log").st_ino
+            for i in range(60):
+                sink.write(f"L{i:03d}")
+            self.assertEqual(os.stat(Path(tmp) / "prog.log").st_ino, ino)
+
+    def test_oversized_existing_log_trims_on_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "prog.log"
+            base.write_text("x" * 500 + "\n", encoding="utf-8")
+            sink = self._sink(tmp)
+            self.assertEqual(base.stat().st_size, 0)
+            self.assertEqual(
+                base.with_name("prog.log.1").stat().st_size, 501)
+            sink.write("fresh")
+            self.assertEqual(base.read_text(encoding="utf-8"), "fresh\n")
+
+
+class FarmErrorDedupeTests(unittest.TestCase):
+    """v0.2.2: a farm error logs once per run; repeats are counted
+    and surface as a single summary line when the run ends."""
+
+    def test_first_logs_repeats_suppressed_summary_on_flush(self):
+        lines = []
+        d = setu_exec.FarmErrorDeduper()
+        for _ in range(43):
+            d.handle(2157, "Sec-def data farm connection is broken:secdefeu",
+                     lines.append)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("2157", lines[0])
+        d.flush(lines.append)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(
+            lines[1], "gateway error 2157 repeated 42 more times, suppressed")
+
+    def test_different_code_flushes_previous_run(self):
+        lines = []
+        d = setu_exec.FarmErrorDeduper()
+        for _ in range(3):
+            d.handle(2157, "broken", lines.append)
+        d.handle(2103, "Market data farm connection is broken:eufarm",
+                 lines.append)
+        self.assertEqual(len(lines), 3)
+        self.assertIn("2157 repeated 2 more times, suppressed", lines[1])
+        self.assertIn("2103", lines[2])
+
+    def test_flush_without_suppression_is_silent(self):
+        lines = []
+        d = setu_exec.FarmErrorDeduper()
+        d.flush(lines.append)
+        d.handle(2157, "broken", lines.append)
+        d.flush(lines.append)
+        self.assertEqual(len(lines), 1)
+
+    def test_ordinary_log_line_flushes_the_run(self):
+        """Through the real log(): farm line, summary, then the
+        ordinary line, in that order."""
+        lines = []
+        fresh = setu_exec.FarmErrorDeduper()
+        with mock.patch.object(setu_exec, "_FARM", fresh), \
+                mock.patch.object(setu_exec, "_write_log_line", lines.append):
+            setu_exec.log_gateway_error(2157, "broken")
+            setu_exec.log_gateway_error(2157, "broken")
+            setu_exec.log("ordinary line")
+        self.assertEqual(lines, [
+            "gateway error 2157: broken",
+            "gateway error 2157 repeated 1 more times, suppressed",
+            "ordinary line",
+        ])
+
+    def test_non_farm_codes_always_log_in_full(self):
+        lines = []
+        fresh = setu_exec.FarmErrorDeduper()
+        with mock.patch.object(setu_exec, "_FARM", fresh), \
+                mock.patch.object(setu_exec, "_write_log_line", lines.append):
+            setu_exec.log_gateway_error(321, "Read-Only API")
+            setu_exec.log_gateway_error(321, "Read-Only API")
+        self.assertEqual(lines, ["gateway error 321: Read-Only API"] * 2)
 
 
 if __name__ == "__main__":

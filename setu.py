@@ -24,6 +24,13 @@ Config: ~/.setu/config.json (see config.example.json).
 Token:  read from the file named by "token_file" in the config
         (default ~/.kubera-ingest-token). Never logged, never sent
         anywhere except as the X-Kubera-Ingest-Token header to Kubera.
+
+v0.2.1 (2026-10-23): bounded, quieter logs only (no feed changes).
+Under launchd the daemon writes its own log through a rotating
+sink — copytruncate at ~2 MB, 3 backups, ~8 MB max, same
+~/.setu/logs/setu.log path — and repeated IB farm/connectivity
+errors are logged once per run with a summary count instead of
+one line per cycle. Same shape as setu-exec v0.2.2.
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -40,7 +48,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 LONDON = ZoneInfo("Europe/London")
 
 # IB account summary tag -> Kubera values key (the ingest contract).
@@ -57,9 +65,150 @@ SUMMARY_TAGS = ",".join(SUMMARY_TAG_MAP.keys())
 UNSET_PRICE = 1.0e100  # ibapi marks unset doubles with a huge sentinel
 
 
-def log(msg: str) -> None:
+# ---------------------------------------------------------------------------
+# Logging: bounded rotating file under launchd, farm-error dedupe.
+# (Same shape as setu_exec.py; the two programs are standalone files.)
+#
+# launchd points StandardOutPath at ~/.setu/logs/<prog>.log, but a
+# process that only prints cannot bound that file: launchd owns the
+# fd. So in daemon mode (stdout not a tty) log() writes through
+# RotatingLogSink, which owns an O_APPEND fd to the SAME path and
+# copytruncates it at ~2 MB, keeping 3 backups (~8 MB max per
+# program). The path and inode never change, so `tail -f` on the
+# live log keeps working across rotations, and because this process
+# is the file's only writer under a lock, no line is lost or
+# duplicated at the seam. In a terminal, log() prints as before.
+# ---------------------------------------------------------------------------
+
+LOG_MAX_BYTES = 2_000_000
+LOG_BACKUP_COUNT = 3
+# IB farm / connectivity notices that repeat verbatim while a farm
+# is sick (the benign set below never reaches the logger at all).
+FARM_ERROR_CODES = {1100, 1101, 1102, 2103, 2105, 2110, 2157}
+
+
+class RotatingLogSink:
+    """An append-mode log file with copytruncate rotation."""
+
+    def __init__(self, path, max_bytes: int = LOG_MAX_BYTES,
+                 backups: int = LOG_BACKUP_COUNT):
+        self.path = Path(path)
+        self.max_bytes = int(max_bytes)
+        self.backups = int(backups)
+        self._lock = threading.Lock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "ab", buffering=0)
+        self._size = os.fstat(self._fh.fileno()).st_size
+        if self._size > self.max_bytes:
+            self._rotate()  # an oversized pre-upgrade log trims at once
+
+    def write(self, line: str) -> None:
+        data = (line + "\n").encode("utf-8")
+        with self._lock:
+            if self._size > 0 and self._size + len(data) > self.max_bytes:
+                self._rotate()
+            self._fh.write(data)
+            self._size += len(data)
+
+    def _rotate(self) -> None:
+        for i in range(self.backups - 1, 0, -1):
+            try:
+                self._backup(i).replace(self._backup(i + 1))
+            except OSError:
+                pass
+        try:
+            with open(self.path, "rb") as src, open(self._backup(1), "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        except OSError:
+            pass
+        os.ftruncate(self._fh.fileno(), 0)
+        self._size = 0
+
+    def _backup(self, n: int) -> Path:
+        return self.path.with_name(self.path.name + f".{n}")
+
+
+class FarmErrorDeduper:
+    """First occurrence of a farm error logs at once; consecutive
+    repeats of the same code are counted, not logged. The count
+    surfaces as one summary line when the run ends — a different
+    farm code, any ordinary log line, or an explicit flush — so a
+    sick farm costs two lines, not one per minute."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._run_code: int | None = None
+        self._suppressed = 0
+
+    def handle(self, code: int, text: str, emit) -> None:
+        with self._lock:
+            if code == self._run_code:
+                self._suppressed += 1
+                return
+            self._flush_locked(emit)
+            self._run_code = code
+            self._suppressed = 0
+            emit(f"gateway error {code}: {text}")
+
+    def flush(self, emit) -> None:
+        with self._lock:
+            self._flush_locked(emit)
+
+    def _flush_locked(self, emit) -> None:
+        if self._run_code is not None and self._suppressed:
+            emit(f"gateway error {self._run_code} repeated "
+                 f"{self._suppressed} more times, suppressed")
+        self._run_code = None
+        self._suppressed = 0
+
+
+_LOG_SINK: RotatingLogSink | None = None
+_FARM = FarmErrorDeduper()
+
+
+def _write_log_line(msg: str) -> None:
     stamp = datetime.now(LONDON).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{stamp}] {msg}", flush=True)
+    line = f"[{stamp}] {msg}"
+    if _LOG_SINK is not None:
+        _LOG_SINK.write(line)
+    else:
+        print(line, flush=True)
+
+
+def log(msg: str) -> None:
+    # An ordinary line ends any farm-error run: flush its summary
+    # first so the count is never stranded.
+    _FARM.flush(_write_log_line)
+    _write_log_line(msg)
+
+
+def log_gateway_error(code: int, text: str) -> None:
+    """Route for IB error callbacks: farm/connectivity codes go
+    through the deduper, everything else logs in full."""
+    if code in FARM_ERROR_CODES:
+        _FARM.handle(code, text, _write_log_line)
+    else:
+        log(f"gateway error {code}: {text}")
+
+
+def _setup_daemon_logging(prog_name: str, config_dir) -> None:
+    """Daemon mode only, and only when stdout is not a tty (the
+    launchd case): point log() at <config_dir>/logs/<prog>.log —
+    the same path install.sh gives launchd. Terminal runs keep
+    printing to the terminal. A logging failure must never kill
+    the daemon: fall back to plain stdout."""
+    global _LOG_SINK
+    if _LOG_SINK is not None:
+        return
+    try:
+        if sys.stdout.isatty():
+            return
+    except Exception:
+        pass
+    try:
+        _LOG_SINK = RotatingLogSink(Path(config_dir) / "logs" / f"{prog_name}.log")
+    except OSError:
+        _LOG_SINK = None
 
 
 def london_now_iso() -> str:
@@ -371,7 +520,7 @@ class GatewayClient:
                 # 2104/2106/2107/2158 are benign farm-status notices.
                 if errorCode in (2104, 2106, 2107, 2158, 2119):
                     return
-                log(f"gateway error {errorCode}: {errorString}")
+                log_gateway_error(errorCode, errorString)
 
         class Client(EClient):
             pass
@@ -651,6 +800,7 @@ def main() -> int:
     cfg = load_config(args.config)
     if args.dry_run:
         return dry_run(cfg)
+    _setup_daemon_logging("setu", Path(args.config).resolve().parent)
     Setu(cfg).run()
     return 0
 

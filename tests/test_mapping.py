@@ -2,10 +2,13 @@
 
 Run: python3 -m pytest tests/  (or python3 -m unittest discover tests)
 """
+import os
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import setu  # noqa: E402
@@ -322,3 +325,112 @@ class OrderStatusMergeTests(unittest.TestCase):
         client.status_by_order = {}
         out = client.apply_statuses()
         self.assertEqual(out[0]["qty_remain"], 1.0)
+
+
+class RotatingLogSinkTests(unittest.TestCase):
+    """v0.2.1: the daemon log is bounded — copytruncate rotation at
+    the configured size, a fixed backup count, no line lost or
+    duplicated at a rotation seam, same inode throughout."""
+
+    def _sink(self, tmp, max_bytes=120, backups=3):
+        return setu.RotatingLogSink(Path(tmp) / "prog.log",
+                                    max_bytes=max_bytes, backups=backups)
+
+    def _all_lines(self, tmp):
+        base = Path(tmp) / "prog.log"
+        out = []
+        for n in (3, 2, 1):
+            b = base.with_name(base.name + f".{n}")
+            if b.exists():
+                out += b.read_text(encoding="utf-8").splitlines()
+        out += base.read_text(encoding="utf-8").splitlines()
+        return out
+
+    def test_rotation_bounds_and_backup_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = self._sink(tmp)
+            for i in range(200):
+                sink.write(f"L{i:03d}")
+            names = sorted(p.name for p in Path(tmp).iterdir())
+            self.assertEqual(names, ["prog.log", "prog.log.1",
+                                     "prog.log.2", "prog.log.3"])
+            for p in Path(tmp).iterdir():
+                self.assertLessEqual(p.stat().st_size, 120)
+
+    def test_no_line_lost_or_duplicated_across_rotations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = self._sink(tmp)  # 120 B/file, 5 B/line -> 24 per file
+            for i in range(60):
+                sink.write(f"L{i:03d}")
+            self.assertEqual(self._all_lines(tmp),
+                             [f"L{i:03d}" for i in range(60)])
+
+    def test_live_path_keeps_its_inode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sink = self._sink(tmp)
+            ino = os.stat(Path(tmp) / "prog.log").st_ino
+            for i in range(60):
+                sink.write(f"L{i:03d}")
+            self.assertEqual(os.stat(Path(tmp) / "prog.log").st_ino, ino)
+
+    def test_oversized_existing_log_trims_on_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "prog.log"
+            base.write_text("x" * 500 + "\n", encoding="utf-8")
+            sink = self._sink(tmp)
+            self.assertEqual(base.stat().st_size, 0)
+            self.assertEqual(
+                base.with_name("prog.log.1").stat().st_size, 501)
+            sink.write("fresh")
+            self.assertEqual(base.read_text(encoding="utf-8"), "fresh\n")
+
+
+class FarmErrorDedupeTests(unittest.TestCase):
+    """v0.2.1: a farm error logs once per run; repeats are counted
+    and surface as a single summary line when the run ends."""
+
+    def test_first_logs_repeats_suppressed_summary_on_flush(self):
+        lines = []
+        d = setu.FarmErrorDeduper()
+        for _ in range(43):
+            d.handle(2157, "Sec-def data farm connection is broken:secdefeu",
+                     lines.append)
+        self.assertEqual(len(lines), 1)
+        d.flush(lines.append)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(
+            lines[1], "gateway error 2157 repeated 42 more times, suppressed")
+
+    def test_different_code_flushes_previous_run(self):
+        lines = []
+        d = setu.FarmErrorDeduper()
+        for _ in range(3):
+            d.handle(2157, "broken", lines.append)
+        d.handle(2103, "Market data farm connection is broken:eufarm",
+                 lines.append)
+        self.assertEqual(len(lines), 3)
+        self.assertIn("2157 repeated 2 more times, suppressed", lines[1])
+        self.assertIn("2103", lines[2])
+
+    def test_ordinary_log_line_flushes_the_run(self):
+        lines = []
+        fresh = setu.FarmErrorDeduper()
+        with mock.patch.object(setu, "_FARM", fresh), \
+                mock.patch.object(setu, "_write_log_line", lines.append):
+            setu.log_gateway_error(2157, "broken")
+            setu.log_gateway_error(2157, "broken")
+            setu.log("ordinary line")
+        self.assertEqual(lines, [
+            "gateway error 2157: broken",
+            "gateway error 2157 repeated 1 more times, suppressed",
+            "ordinary line",
+        ])
+
+    def test_non_farm_codes_always_log_in_full(self):
+        lines = []
+        fresh = setu.FarmErrorDeduper()
+        with mock.patch.object(setu, "_FARM", fresh), \
+                mock.patch.object(setu, "_write_log_line", lines.append):
+            setu.log_gateway_error(321, "something real")
+            setu.log_gateway_error(321, "something real")
+        self.assertEqual(lines, ["gateway error 321: something real"] * 2)

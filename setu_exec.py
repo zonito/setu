@@ -60,6 +60,21 @@ account):
     transient what-if timeout refused a row before live ever
     saw it. Live gate_failed behaviour is unchanged.
 
+v0.2.2 (2026-10-23):
+  * The Pushover notify POST goes through a dedicated opener
+    with an explicitly empty proxy map. v0.2.1's investigation
+    found the default urlopen honouring proxy settings inherited
+    from the process environment: on Nikhila's machine that
+    fenced the direct Varuna call (HTTP 403) while the direct
+    Kubera posts beside it succeeded. URL, headers and body are
+    unchanged; the Kubera client is untouched.
+  * Bounded, quieter logs (shared shape with setu.py v0.2.1):
+    under launchd the executor writes its own log through a
+    rotating sink — copytruncate at ~2 MB, 3 backups, ~8 MB max,
+    same ~/.setu/logs/setu-exec.log path — and repeated IB farm/
+    connectivity errors are logged once per run with a summary
+    count instead of one line per cycle.
+
 Config: account, Kubera and Gateway settings come from the same
 ~/.setu/config.json Setu uses (read, never written by this program).
 Mode and executor knobs live in executor.json beside it. The ingest
@@ -75,6 +90,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import stat
 import sys
 import threading
@@ -85,7 +101,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -96,9 +112,150 @@ BENIGN_ERRORS = {2104, 2106, 2107, 2158, 2119}
 UNSET = 1.0e100  # ibapi marks unset doubles with a huge sentinel
 
 
-def log(msg: str) -> None:
+# ---------------------------------------------------------------------------
+# Logging: bounded rotating file under launchd, farm-error dedupe.
+# (Same shape as setu.py; the two programs are standalone files.)
+#
+# launchd points StandardOutPath at ~/.setu/logs/<prog>.log, but a
+# process that only prints cannot bound that file: launchd owns the
+# fd. So in daemon mode (stdout not a tty) log() writes through
+# RotatingLogSink, which owns an O_APPEND fd to the SAME path and
+# copytruncates it at ~2 MB, keeping 3 backups (~8 MB max per
+# program). The path and inode never change, so `tail -f` on the
+# live log keeps working across rotations, and because this process
+# is the file's only writer under a lock, no line is lost or
+# duplicated at the seam. In a terminal, log() prints as before.
+# ---------------------------------------------------------------------------
+
+LOG_MAX_BYTES = 2_000_000
+LOG_BACKUP_COUNT = 3
+# IB farm / connectivity notices that repeat verbatim while a farm
+# is sick (the benign set below never reaches the logger at all).
+FARM_ERROR_CODES = {1100, 1101, 1102, 2103, 2105, 2110, 2157}
+
+
+class RotatingLogSink:
+    """An append-mode log file with copytruncate rotation."""
+
+    def __init__(self, path, max_bytes: int = LOG_MAX_BYTES,
+                 backups: int = LOG_BACKUP_COUNT):
+        self.path = Path(path)
+        self.max_bytes = int(max_bytes)
+        self.backups = int(backups)
+        self._lock = threading.Lock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "ab", buffering=0)
+        self._size = os.fstat(self._fh.fileno()).st_size
+        if self._size > self.max_bytes:
+            self._rotate()  # an oversized pre-upgrade log trims at once
+
+    def write(self, line: str) -> None:
+        data = (line + "\n").encode("utf-8")
+        with self._lock:
+            if self._size > 0 and self._size + len(data) > self.max_bytes:
+                self._rotate()
+            self._fh.write(data)
+            self._size += len(data)
+
+    def _rotate(self) -> None:
+        for i in range(self.backups - 1, 0, -1):
+            try:
+                self._backup(i).replace(self._backup(i + 1))
+            except OSError:
+                pass
+        try:
+            with open(self.path, "rb") as src, open(self._backup(1), "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        except OSError:
+            pass
+        os.ftruncate(self._fh.fileno(), 0)
+        self._size = 0
+
+    def _backup(self, n: int) -> Path:
+        return self.path.with_name(self.path.name + f".{n}")
+
+
+class FarmErrorDeduper:
+    """First occurrence of a farm error logs at once; consecutive
+    repeats of the same code are counted, not logged. The count
+    surfaces as one summary line when the run ends — a different
+    farm code, any ordinary log line, or an explicit flush — so a
+    sick farm costs two lines, not one per minute."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._run_code: int | None = None
+        self._suppressed = 0
+
+    def handle(self, code: int, text: str, emit) -> None:
+        with self._lock:
+            if code == self._run_code:
+                self._suppressed += 1
+                return
+            self._flush_locked(emit)
+            self._run_code = code
+            self._suppressed = 0
+            emit(f"gateway error {code}: {text}")
+
+    def flush(self, emit) -> None:
+        with self._lock:
+            self._flush_locked(emit)
+
+    def _flush_locked(self, emit) -> None:
+        if self._run_code is not None and self._suppressed:
+            emit(f"gateway error {self._run_code} repeated "
+                 f"{self._suppressed} more times, suppressed")
+        self._run_code = None
+        self._suppressed = 0
+
+
+_LOG_SINK: RotatingLogSink | None = None
+_FARM = FarmErrorDeduper()
+
+
+def _write_log_line(msg: str) -> None:
     stamp = datetime.now(LONDON).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{stamp}] {msg}", flush=True)
+    line = f"[{stamp}] {msg}"
+    if _LOG_SINK is not None:
+        _LOG_SINK.write(line)
+    else:
+        print(line, flush=True)
+
+
+def log(msg: str) -> None:
+    # An ordinary line ends any farm-error run: flush its summary
+    # first so the count is never stranded.
+    _FARM.flush(_write_log_line)
+    _write_log_line(msg)
+
+
+def log_gateway_error(code: int, text: str) -> None:
+    """Route for IB error callbacks: farm/connectivity codes go
+    through the deduper, everything else logs in full."""
+    if code in FARM_ERROR_CODES:
+        _FARM.handle(code, text, _write_log_line)
+    else:
+        log(f"gateway error {code}: {text}")
+
+
+def _setup_daemon_logging(prog_name: str, config_dir) -> None:
+    """Daemon modes only, and only when stdout is not a tty (the
+    launchd case): point log() at <config_dir>/logs/<prog>.log —
+    the same path install.sh gives launchd. Terminal runs keep
+    printing to the terminal. A logging failure must never kill
+    the daemon: fall back to plain stdout."""
+    global _LOG_SINK
+    if _LOG_SINK is not None:
+        return
+    try:
+        if sys.stdout.isatty():
+            return
+    except Exception:
+        pass
+    try:
+        _LOG_SINK = RotatingLogSink(Path(config_dir) / "logs" / f"{prog_name}.log")
+    except OSError:
+        _LOG_SINK = None
 
 
 def to_float(value) -> float | None:
@@ -586,6 +743,20 @@ def build_pushover_request(cfg: dict, title: str, message: str):
     return url, headers, payload
 
 
+def _direct_opener():
+    """An opener with an explicitly empty proxy map: it never
+    consults the environment or the system for proxy settings.
+    The notify POST must go direct — v0.2.1's investigation found
+    the default urlopen honouring proxy settings inherited from
+    the process environment on Nikhila's machine, which fenced
+    this call (HTTP 403) while the executor's direct Kubera posts
+    beside it succeeded."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+_NOTIFY_OPENER = _direct_opener()
+
+
 def send_pushover(cfg: dict, title: str, message: str) -> bool:
     """Best-effort: a failed notification never blocks or crashes
     anything. Returns True only when the POST completed."""
@@ -594,7 +765,7 @@ def send_pushover(cfg: dict, title: str, message: str) -> bool:
         url, data=json.dumps(payload).encode("utf-8"), method="POST",
         headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with _NOTIFY_OPENER.open(req, timeout=5) as resp:
             resp.read()
         return True
     except Exception as exc:
@@ -707,7 +878,7 @@ class ExecGateway:
                         # fetch aborts instead of trusting a partial
                         # list or waiting out the full timeout.
                         outer.read_error = f"IB error {errorCode}: {errorString}"
-                    log(f"gateway error {errorCode}: {errorString}")
+                    log_gateway_error(errorCode, errorString)
 
             def connectionClosed(self):
                 outer.connected_event.clear()
@@ -1292,6 +1463,7 @@ def main() -> int:
         print("live enable file removed; live mode will refuse to start.")
         return 0
 
+    _setup_daemon_logging("setu-exec", cfg["_config_dir"])
     kubera = KuberaClient(cfg)
     gateway = ExecGateway(cfg)
     executor = Executor(cfg, kubera, gateway)

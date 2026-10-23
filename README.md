@@ -161,8 +161,13 @@ before live mode is enabled.
 - Transition: when Setu takes over an account, switch that account's
   browser export off in the Enhancer gear panel so the two feeds do
   not double-report orders during the handover.
-- Logs: `~/.setu/logs/setu.log`. A dry run that prints the exact
-  snapshots without sending: `~/.setu/venv/bin/python ~/.setu/setu.py --dry-run`.
+- Logs: `~/.setu/logs/setu.log` and `~/.setu/logs/setu-exec.log`.
+  Both are bounded (setu v0.2.1 / setu-exec v0.2.2): each program
+  rotates its own log at ~2 MB keeping 3 backups (~8 MB max), and
+  repeated IB farm/connectivity errors are logged once per run
+  with a summary count instead of one line per cycle. A dry run
+  that prints the exact snapshots without sending:
+  `~/.setu/venv/bin/python ~/.setu/setu.py --dry-run`.
 
 ## Growth path
 
