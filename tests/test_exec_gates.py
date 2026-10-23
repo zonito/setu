@@ -352,16 +352,24 @@ class SimulateFlowTests(unittest.TestCase):
             self.assertEqual(detail["effective_qty"], 3.0)
             self.assertEqual(detail["whatif"]["init_margin_change"], -1500.0)
 
-    def test_gate_failure_posts_gate_failed(self):
+    def test_gate_failure_is_non_terminal_in_simulate(self):
+        # v0.2.1: a simulate gate failure posts would_place with a
+        # simulate_gate_failed detail (Kubera maps that back to
+        # APPROVED), never gate_failed — a transient simulate
+        # failure must not refuse the row before live sees it.
         with tempfile.TemporaryDirectory() as tmp:
             kubera = FakeKubera()
             gw = FakeGateway(position=None)  # no live position at all
             ex = make_executor(tmp, kubera=kubera, gateway=gw)
             ex.cycle()
             kinds = [k for _id, k, _d in kubera.events]
-            self.assertEqual(kinds, ["placing", "gate_failed"])
-            self.assertEqual(kubera.events[1][2]["gate"], "position")
+            self.assertEqual(kinds, ["placing", "would_place"])
+            detail = kubera.events[1][2]
+            self.assertTrue(detail["simulate_gate_failed"])
+            self.assertEqual(detail["gate"], "position")
+            self.assertIn("no live position", detail["reason"])
             self.assertEqual(gw.whatif_specs, [])
+            self.assertEqual(gw.transmit_specs, [])
 
 
 class LiveFlowTests(unittest.TestCase):
@@ -688,8 +696,9 @@ class IncompleteGateway(FakeGateway):
 
 class ReadsIncompleteRowTests(unittest.TestCase):
     """Item 2 (executor half): incomplete reads abort the cycle
-    before any claim; a row handed partial reads is refused with
-    the reads_incomplete gate, never evaluated."""
+    before any claim; a row handed partial reads is failed with
+    the reads_incomplete gate, never evaluated. Since v0.2.1 the
+    failure is non-terminal in simulate, terminal in live."""
 
     def test_cycle_aborts_before_poll_on_incomplete_reads(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -700,15 +709,65 @@ class ReadsIncompleteRowTests(unittest.TestCase):
             self.assertEqual(gw.whatif_specs, [])
             self.assertEqual(gw.transmit_specs, [])
 
-    def test_process_row_refuses_partial_reads(self):
+    def test_process_row_partial_reads_non_terminal_in_simulate(self):
         with tempfile.TemporaryDirectory() as tmp:
             kubera, gw = FakeKubera(), FakeGateway()
             ex = make_executor(tmp, kubera=kubera, gateway=gw)
             ex.process_row(dict(ROW), None, [])
             kinds = [k for _id, k, _d in kubera.events]
+            self.assertEqual(kinds, ["placing", "would_place"])
+            detail = kubera.events[1][2]
+            self.assertTrue(detail["simulate_gate_failed"])
+            self.assertEqual(detail["gate"], "reads_incomplete")
+            self.assertEqual(gw.whatif_specs, [])
+
+    def test_process_row_partial_reads_refuse_in_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera, gw = FakeKubera(), FakeGateway()
+            ex = make_executor(tmp, kubera=kubera, gateway=gw,
+                               mode="live", live_file=True)
+            ex.process_row(dict(ROW), None, [])
+            kinds = [k for _id, k, _d in kubera.events]
             self.assertEqual(kinds, ["placing", "gate_failed"])
             self.assertEqual(kubera.events[1][2]["gate"], "reads_incomplete")
             self.assertEqual(gw.whatif_specs, [])
+            self.assertEqual(gw.transmit_specs, [])
+
+
+class SimulateGateFailureTests(unittest.TestCase):
+    """v0.2.1 change 2: simulate gate failures are recorded but
+    never terminal; live gate failures still post gate_failed.
+    The what-if failure is the incident case: a transient
+    'no what-if reply' in a simulate cycle terminalised a row
+    before live ever started."""
+
+    def test_simulate_whatif_failure_is_non_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera = FakeKubera()
+            gw = FakeGateway(whatif_reply={
+                "ok": False, "error": "no what-if reply from the Gateway"})
+            ex = make_executor(tmp, kubera=kubera, gateway=gw)
+            ex.cycle()
+            kinds = [k for _id, k, _d in kubera.events]
+            self.assertEqual(kinds, ["placing", "would_place"])
+            detail = kubera.events[1][2]
+            self.assertTrue(detail["simulate_gate_failed"])
+            self.assertEqual(detail["gate"], "whatif")
+            self.assertIn("no what-if reply", detail["reason"])
+            self.assertEqual(gw.transmit_specs, [])
+
+    def test_live_whatif_failure_still_posts_gate_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera = FakeKubera()
+            gw = FakeGateway(whatif_reply={
+                "ok": False, "error": "no what-if reply from the Gateway"})
+            ex = make_executor(tmp, kubera=kubera, gateway=gw,
+                               mode="live", live_file=True)
+            ex.cycle()
+            kinds = [k for _id, k, _d in kubera.events]
+            self.assertEqual(kinds, ["placing", "gate_failed"])
+            self.assertEqual(kubera.events[1][2]["gate"], "whatif")
+            self.assertEqual(gw.transmit_specs, [])
 
 
 class LimitPremiumGateTests(unittest.TestCase):
@@ -739,11 +798,26 @@ class LimitPremiumGateTests(unittest.TestCase):
         self.assertFalse(ok)
 
 
+class TwoPositionGateway(FakeGateway):
+    """FakeGateway returns a single position; a two-row cycle
+    needs both contracts live at once."""
+
+    def fetch_positions(self):
+        self.fetch_count += 1
+        return {843250654: short_position(), 222: short_position2()}
+
+
 class RunawayBrakeTests(unittest.TestCase):
     """Item 4: 60s spacing + 25/day from the state file. Accident
-    insurance on live transmissions; simulate is untouched."""
+    insurance on live transmissions; simulate is untouched.
+    Since v0.2.1 the brake DEFERS: no gate_failed, no transmit,
+    the row is left APPROVED via a would_place (deferred) event
+    and a later cycle transmits it."""
 
-    def test_spacing_blocks_second_live_placement(self):
+    def test_spacing_defers_second_live_placement(self):
+        # The 2026-10-23 incident shape: NFLX transmitted, then the
+        # next three approved rows were terminally REFUSED at 1s
+        # spacing. Now the second row must defer instead.
         with tempfile.TemporaryDirectory() as tmp:
             kubera, gw = FakeKubera(rows=[]), FakeGateway()
             ex = make_executor(tmp, kubera=kubera, gateway=gw,
@@ -751,12 +825,50 @@ class RunawayBrakeTests(unittest.TestCase):
             ex.process_row(dict(ROW), {843250654: short_position()}, [])
             ex.process_row(dict(ROW2), {222: short_position2()}, [])
             self.assertEqual(len(gw.transmit_specs), 1)
-            failures = [d for _id, k, d in kubera.events if k == "gate_failed"]
-            self.assertEqual(len(failures), 1)
-            self.assertEqual(failures[0]["gate"], "runaway_brake")
-            self.assertIn("spacing", failures[0]["reason"])
+            failures = [e for e in kubera.events if e[1] == "gate_failed"]
+            self.assertEqual(failures, [],
+                             "a brake block is a deferral, never a refusal")
+            row2 = [(k, d) for rid, k, d in kubera.events if rid == "row-456"]
+            self.assertEqual([k for k, _d in row2], ["placing", "would_place"])
+            self.assertTrue(row2[1][1]["deferred"])
+            self.assertEqual(row2[1][1]["gate"], "runaway_brake")
+            self.assertIn("spacing", row2[1][1]["reason"])
+            self.assertIsNone(ex.tracker.get("row-456"),
+                              "a deferred row is not tracked as placed")
 
-    def test_daily_cap_blocks_live_placement(self):
+    def test_deferred_row_transmits_on_a_later_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera = FakeKubera(rows=[dict(ROW), dict(ROW2)])
+            gw = TwoPositionGateway()
+            ex = make_executor(tmp, kubera=kubera, gateway=gw,
+                               mode="live", live_file=True)
+            ex.cycle()
+            self.assertEqual(len(gw.transmit_specs), 1,
+                             "cycle 1: first row transmits, second defers")
+            self.assertIsNotNone(ex.tracker.get("row-123"))
+            self.assertIsNone(ex.tracker.get("row-456"))
+            # 61 seconds pass; the placed row is visible as a live
+            # open order so reconciliation leaves it alone.
+            aged = (datetime.now(setu_exec.LONDON)
+                    - timedelta(seconds=61)).isoformat(timespec="seconds")
+            ex.tracker.transmissions = [aged]
+            ex.tracker.save()
+            gw.open_orders = [{
+                "con_id": 843250654, "action": "BUY", "limit_price": 2.51,
+                "order_ref": "row-123", "status": "Submitted",
+                "perm_id": 777}]
+            ex.cycle()
+            self.assertEqual(len(gw.transmit_specs), 2,
+                             "cycle 2: the deferred row transmits")
+            self.assertEqual(
+                gw.transmit_specs[1]["order"]["orderRef"], "row-456")
+            placed = [d for rid, k, d in kubera.events
+                      if rid == "row-456" and k == "placed"]
+            self.assertEqual(len(placed), 1)
+            failures = [e for e in kubera.events if e[1] == "gate_failed"]
+            self.assertEqual(failures, [])
+
+    def test_daily_cap_defers_live_placement(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_cfg(tmp, mode="live", live_file=True)
             arm(cfg)
@@ -771,8 +883,14 @@ class RunawayBrakeTests(unittest.TestCase):
             ex = setu_exec.Executor(cfg, kubera, gw)
             ex.process_row(dict(ROW), {843250654: short_position()}, [])
             self.assertEqual(gw.transmit_specs, [])
-            failures = [d for _id, k, d in kubera.events if k == "gate_failed"]
-            self.assertEqual(failures[0]["gate"], "runaway_brake")
+            failures = [e for e in kubera.events if e[1] == "gate_failed"]
+            self.assertEqual(failures, [],
+                             "the daily cap defers silently, never refuses")
+            kinds = [k for _id, k, _d in kubera.events]
+            self.assertEqual(kinds, ["placing", "would_place"])
+            self.assertTrue(kubera.events[1][2]["deferred"])
+            self.assertEqual(kubera.events[1][2]["gate"], "runaway_brake")
+            self.assertIn("cap", kubera.events[1][2]["reason"])
 
     def test_brake_check_spacing_and_cap_reasons(self):
         now = datetime(2026, 10, 23, 12, 0, tzinfo=setu_exec.LONDON)

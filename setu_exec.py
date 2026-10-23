@@ -46,6 +46,20 @@ weight on software guardrails instead — "security first"):
   * Live mode refuses to run while executor.json or executor.live
     is group- or other-writable.
 
+v0.2.1 (2026-10-23, from the first live batch on Nikhila's
+account):
+  * The runaway brake DEFERS, never refuses. When it blocks a
+    transmission the row is left APPROVED (a would_place event
+    with a deferred detail returns it there) and a later cycle
+    transmits it once the brake clears. v0.2.0 posted gate_failed
+    and terminalised three approved rows that were merely early.
+  * Simulate gate failures are NOT terminal. A simulate failure
+    is posted as would_place with a simulate_gate_failed detail,
+    so the row returns to APPROVED with the failure preserved in
+    Kubera's events log. v0.2.0 posted gate_failed, and a
+    transient what-if timeout refused a row before live ever
+    saw it. Live gate_failed behaviour is unchanged.
+
 Config: account, Kubera and Gateway settings come from the same
 ~/.setu/config.json Setu uses (read, never written by this program).
 Mode and executor knobs live in executor.json beside it. The ingest
@@ -71,7 +85,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -434,6 +448,21 @@ class PlacedTracker:
                                f"{gap:.0f}s ago (< {RUNAWAY_MIN_SPACING_SECONDS:.0f}s "
                                f"minimum spacing)")
         return True, ""
+
+    def brake_wait_seconds(self, now: datetime | None = None) -> float | None:
+        """How long until the brake would clear: seconds remaining
+        on the spacing half, 0.0 when not blocked, or None when the
+        block is the daily cap (which clears at the London day
+        rollover, not on a timer). Mirrors brake_check exactly."""
+        now = now or datetime.now(LONDON)
+        times = self._transmission_times()
+        if sum(1 for t in times if t.date() == now.date()) >= RUNAWAY_DAILY_CAP:
+            return None
+        if times:
+            gap = (now - max(times)).total_seconds()
+            if gap < RUNAWAY_MIN_SPACING_SECONDS:
+                return RUNAWAY_MIN_SPACING_SECONDS - gap
+        return 0.0
 
     def add(self, row_id: str, record: dict) -> None:
         self.orders[str(row_id)] = record
@@ -1020,6 +1049,32 @@ class Executor:
                      f"{self.account} {line} — refused at gate "
                      f"[{detail.get('gate')}]: {detail.get('reason')}")
 
+    def _report_gate_failure(self, row: dict, detail: dict, line: str) -> None:
+        """A gate verdict, reported mode-appropriately (v0.2.1).
+
+        Live: gate_failed, which Kubera maps to a terminal REFUSED,
+        plus the refusal Pushover. Terminal is right in live: a human
+        should look before that row is tried again.
+
+        Simulate: NOT terminal. The failure is posted as would_place
+        with a simulate_gate_failed detail — Kubera maps would_place
+        back to APPROVED and preserves the detail in the events log,
+        so a transient simulate failure (a what-if timeout, a farm
+        hiccup) can never refuse a row before live has seen it. The
+        executor log line stays explicit either way."""
+        if self.mode == "simulate":
+            log(f"SIMULATE GATE FAILED [{detail.get('gate')}] {line}"
+                f" — {detail.get('reason')}")
+            self._report(row["id"], "would_place", {
+                "simulate_gate_failed": True,
+                "gate": detail.get("gate"),
+                "reason": detail.get("reason")})
+            return
+        log(f"GATE FAILED [{detail.get('gate')}] {line}"
+            f" — {detail.get('reason')}")
+        self._report(row["id"], "gate_failed", detail)
+        self._notify_refusal(row, detail)
+
     # -- one staged row -------------------------------------------------------
     def process_row(self, row: dict, positions: dict[int, dict] | None,
                     open_orders: list[dict] | None) -> None:
@@ -1030,19 +1085,16 @@ class Executor:
             detail = {"gate": "reads_incomplete",
                       "reason": "live Gateway reads did not complete; "
                                 "refusing to evaluate gates on partial data"}
-            log(f"GATE FAILED [reads_incomplete] "
-                f"{order_line(row, row['quantity'], row['target_limit'] or 0)}"
-                f" — {detail['reason']}")
-            self._report(row["id"], "gate_failed", detail)
-            self._notify_refusal(row, detail)
+            self._report_gate_failure(
+                row, detail,
+                order_line(row, row['quantity'], row['target_limit'] or 0))
             return
         position = positions.get(int(row["con_id"]))
         ok, detail = evaluate_gates(row, position, open_orders)
         if not ok:
-            log(f"GATE FAILED [{detail['gate']}] {order_line(row, row['quantity'], row['target_limit'] or 0)}"
-                f" — {detail['reason']}")
-            self._report(row["id"], "gate_failed", detail)
-            self._notify_refusal(row, detail)
+            self._report_gate_failure(
+                row, detail,
+                order_line(row, row['quantity'], row['target_limit'] or 0))
             return
         qty, limit = detail["effective_qty"], detail["limit"]
         line = order_line(row, qty, limit)
@@ -1057,9 +1109,7 @@ class Executor:
             reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         ok, detail = gate_whatif(reply)
         if not ok:
-            log(f"GATE FAILED [whatif] {line} — {detail['reason']}")
-            self._report(row["id"], "gate_failed", detail)
-            self._notify_refusal(row, detail)
+            self._report_gate_failure(row, detail, line)
             return
 
         if self.mode == "simulate":
@@ -1070,13 +1120,25 @@ class Executor:
             return
 
         # Live mode: gates all passed. Runaway brake last, at the one
-        # point where a transmission is about to happen (v0.2).
+        # point where a transmission is about to happen. The brake
+        # DEFERS, never refuses (v0.2.1): a row that is merely early
+        # in a batch is left APPROVED — the would_place event below
+        # returns it there with the deferral preserved in the detail —
+        # and a later cycle transmits it once the brake clears. No
+        # transmission is recorded; the brake counts only actual
+        # transmissions, so a deferral never feeds it.
         brake_ok, brake_reason = self.tracker.brake_check()
         if not brake_ok:
-            detail = {"gate": "runaway_brake", "reason": brake_reason}
-            log(f"GATE FAILED [runaway_brake] {line} — {brake_reason}")
-            self._report(row["id"], "gate_failed", detail)
-            self._notify_refusal(row, detail)
+            wait = self.tracker.brake_wait_seconds()
+            if wait is not None:
+                log(f"RUNAWAY BRAKE [defer] {line} — {brake_reason}; "
+                    f"retry in ~{wait:.0f}s, row left APPROVED")
+            else:
+                log(f"RUNAWAY BRAKE [defer] {line} — {brake_reason}; "
+                    f"row left APPROVED until the daily count resets")
+            self._report(row["id"], "would_place", {
+                "deferred": True, "gate": "runaway_brake",
+                "reason": brake_reason})
             return
         spec = build_order_spec(row, qty, limit, what_if=False)
         # Record BEFORE transmitting so a crash mid-placement leaves a
