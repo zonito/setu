@@ -1,0 +1,1 @@
+{"account_id":"U19377323","account_label":null,"client_id":21,"heartbeat_seconds":300,"http_proxy":null,"ib_host":"127.0.0.1","ib_port":4001,"interval_seconds":60,"kubera_base":"http://127.0.0.1:8000","token_file":"~/.kubera-ingest-token"}
