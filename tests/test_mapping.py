@@ -135,3 +135,34 @@ class ReadOnlyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrderStatusMergeTests(unittest.TestCase):
+    def test_quantities_come_from_order_status(self):
+        try:
+            client = setu.GatewayClient(
+                {"account_id": "U19377323", "ib_host": "127.0.0.1",
+                 "ib_port": 4001, "client_id": 99})
+        except Exception:
+            self.skipTest("ibapi unavailable")
+        mapped = {"order_id": "555", "status": "PreSubmitted",
+                  "qty_total": 3.0, "qty_filled": 0.0, "qty_remain": 0.0}
+        client.orders = [(("p", 555), mapped)]
+        client.status_by_order = {("p", 555): ("PreSubmitted", 0.0, 3.0)}
+        out = client.apply_statuses()
+        self.assertEqual(out[0]["qty_remain"], 3.0)
+        self.assertEqual(out[0]["qty_filled"], 0.0)
+
+    def test_missing_status_keeps_sweep_values(self):
+        try:
+            client = setu.GatewayClient(
+                {"account_id": "U19377323", "ib_host": "127.0.0.1",
+                 "ib_port": 4001, "client_id": 99})
+        except Exception:
+            self.skipTest("ibapi unavailable")
+        mapped = {"order_id": "556", "status": "Submitted",
+                  "qty_total": 1.0, "qty_filled": 0.0, "qty_remain": 1.0}
+        client.orders = [(("p", 556), mapped)]
+        client.status_by_order = {}
+        out = client.apply_statuses()
+        self.assertEqual(out[0]["qty_remain"], 1.0)

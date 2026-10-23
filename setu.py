@@ -37,7 +37,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 LONDON = ZoneInfo("Europe/London")
 
 # IB account summary tag -> Kubera values key (the ingest contract).
@@ -175,7 +175,8 @@ class GatewayClient:
         self.account = cfg["account_id"]
         self.summary: dict[str, tuple[float | None, str]] = {}
         self.summary_at = 0.0
-        self.orders: list[dict] = []
+        self.orders: list = []  # (join key, mapped order dict) per sweep
+        self.status_by_order: dict = {}  # join key -> (status, filled, remaining)
         self.orders_event = threading.Event()
         self.connected_event = threading.Event()
         self.managed_accounts: list[str] = []
@@ -201,10 +202,23 @@ class GatewayClient:
                 perm = getattr(order, "permId", 0)
                 mapped = broker_order(perm if perm else orderId, contract, order, orderState)
                 mapped["raw"] = raw_line(mapped)
-                outer.orders.append(mapped)
+                # Join key for orderStatus: permId (globally unique).
+                # Bare orderIds repeat across clients and must not be
+                # used to merge quantities.
+                key = ("p", int(perm)) if perm else ("i", int(orderId))
+                outer.orders.append((key, mapped))
 
             def openOrderEnd(self):
                 outer.orders_event.set()
+
+            def orderStatus(self, orderId, status, filled, remaining, avgFillPrice,
+                            permId=0, parentId=0, lastFillPrice=0.0, clientId=0,
+                            whyHeld="", mktCapPrice=0.0):
+                # In this API generation the live quantities arrive here,
+                # not on openOrder's OrderState (which leaves them unset).
+                key = ("p", int(permId)) if permId else ("i", int(orderId))
+                outer.status_by_order[key] = (
+                    str(status or ""), to_float(filled), to_float(remaining))
 
             def connectionClosed(self):
                 outer.connected_event.clear()
@@ -247,13 +261,29 @@ class GatewayClient:
             return False
 
     # -- reads ----------------------------------------------------------
+    def apply_statuses(self) -> list[dict]:
+        """Merge orderStatus quantities into the swept open orders."""
+        out = []
+        for api_id, mapped in self.orders:
+            st = self.status_by_order.get(api_id)
+            if st:
+                status, filled, remaining = st
+                if status:
+                    mapped["status"] = status
+                if filled is not None:
+                    mapped["qty_filled"] = filled
+                if remaining is not None:
+                    mapped["qty_remain"] = remaining
+            out.append(mapped)
+        return out
+
     def fetch_orders(self, timeout: float = 20.0) -> list[dict] | None:
         self.orders = []
         self.orders_event.clear()
         self.client.reqAllOpenOrders()
         if not self.orders_event.wait(timeout=timeout):
             return None
-        return list(self.orders)
+        return self.apply_statuses()
 
 
 # ---------------------------------------------------------------------------
