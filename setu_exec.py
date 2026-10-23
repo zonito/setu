@@ -22,14 +22,29 @@ Safety rails, both modes, no exceptions:
   * Daily arm file (executor.armed, contents = today's Europe/London
     date). Yesterday's arm never works. `arm` writes it, `disarm`
     removes it.
-  * Kubera kill switch, read fresh every cycle.
-  * Gates, in order: live reads -> position real -> no duplicate ->
-    price sane -> frozen order shape -> what-if margin preview.
+  * Kubera kill switch, read fresh every cycle, fail-closed: any
+    control-read failure or malformed reply idles the cycle.
+  * Gates, in order: live reads (complete, or the cycle aborts) ->
+    position real -> no duplicate -> price sane -> limit below
+    premium -> frozen order shape -> what-if margin preview.
   * One staged row can produce at most one live order, ever: the
     order carries orderRef = staged row id, and placed orders are
     tracked in executor-state.json across restarts and reconciled
     by that ref against live open orders before anything new runs.
   * No quantity caps (dropped at Zonito's instruction, 2026-10-23).
+
+v0.2.0 guardrail hardening (2026-10-23, after Zonito kept the IB
+Gateway Read-Only API setting OFF on both machines and put the
+weight on software guardrails instead — "security first"):
+  * Runaway brake (accident insurance, not a trade cap): at least
+    60 seconds between live transmissions and at most 25 live
+    placements per account per London day, counted from the state
+    file. Simulate mode is unaffected.
+  * Live mode pushes a Pushover (via Varuna on the Kubera host,
+    port 8400; override with executor.json "notify_base") on every
+    live placement and every gate refusal. Simulate never notifies.
+  * Live mode refuses to run while executor.json or executor.live
+    is group- or other-writable.
 
 Config: account, Kubera and Gateway settings come from the same
 ~/.setu/config.json Setu uses (read, never written by this program).
@@ -46,18 +61,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
+RUNAWAY_MIN_SPACING_SECONDS = 60.0   # min gap between live transmissions
+RUNAWAY_DAILY_CAP = 25               # max live placements per London day
 TERMINAL_STATUSES = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
 BENIGN_ERRORS = {2104, 2106, 2107, 2158, 2119}
 UNSET = 1.0e100  # ibapi marks unset doubles with a huge sentinel
@@ -168,10 +187,33 @@ def gate_price(row: dict, position: dict | None) -> tuple[bool, dict]:
     return True, {"limit": computed}
 
 
+def gate_limit_below_premium(row: dict, limit: float | None) -> tuple[bool, dict]:
+    """Invariant after G5: a 60% take-profit buy-to-close must cost
+    strictly less per unit than the premium received. limit >= premium
+    can only mean corrupted inputs (a limit at or above the premium
+    would hand back the whole credit or worse), so refuse and name
+    both numbers. Defence in depth: G5 normally makes this
+    unreachable, which is exactly why a breach means the inputs
+    cannot be trusted."""
+    premium = to_float(row.get("premium"))
+    limit = to_float(limit)
+    if premium is None or limit is None:
+        return False, {"gate": "limit_premium",
+                       "reason": "premium or limit missing; cannot verify "
+                                 "the limit < premium invariant"}
+    if limit >= premium:
+        return False, {"gate": "limit_premium",
+                       "reason": f"limit {limit} >= premium {premium}: a "
+                                 f"take-profit buy-to-close must cost less "
+                                 f"per unit than the premium received"}
+    return True, {}
+
+
 def evaluate_gates(row: dict, position: dict | None,
                    open_orders: list[dict]) -> tuple[bool, dict]:
-    """G3 -> G4 -> G5. On success the detail carries effective_qty,
-    limit and the reduced flag; on failure, gate + reason."""
+    """G3 -> G4 -> G5 -> limit<premium invariant. On success the
+    detail carries effective_qty, limit and the reduced flag; on
+    failure, gate + reason."""
     ok, detail = gate_position(row, position)
     if not ok:
         return False, detail
@@ -182,6 +224,9 @@ def evaluate_gates(row: dict, position: dict | None,
     ok, price = gate_price(row, position)
     if not ok:
         return False, price
+    ok, inv = gate_limit_below_premium(row, price["limit"])
+    if not ok:
+        return False, inv
     return True, {"effective_qty": eff_qty,
                   "limit": price["limit"],
                   "reduced": detail["reduced"],
@@ -271,6 +316,28 @@ def live_enabled(cfg: dict) -> bool:
     return live_path(cfg).exists()
 
 
+def live_file_hygiene_refusal(cfg: dict) -> str | None:
+    """Live mode only: the two files that switch live trading on —
+    executor.json (carries mode=live) and executor.live (the enable
+    file) — must not be writable by group or other. Anyone who can
+    edit them can arm this program; if either is loose, refuse.
+    Missing files are skipped (a missing executor.json cannot have
+    selected live mode in production, and a missing executor.live
+    is already its own refusal)."""
+    candidates = (("executor.json", Path(cfg["_config_dir"]) / "executor.json"),
+                  ("executor.live", live_path(cfg)))
+    for name, path in candidates:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if st.st_mode & 0o022:
+            return (f"{name} ({path}) is group/other-writable "
+                    f"(mode {oct(stat.S_IMODE(st.st_mode))}); refusing "
+                    f"live mode until tightened (chmod 600)")
+    return None
+
+
 def resolve_mode(cfg: dict) -> tuple[str, str | None]:
     """Returns (mode, refusal). Live mode without the enable file is
     a refusal, never a silent downgrade to simulate."""
@@ -282,6 +349,10 @@ def resolve_mode(cfg: dict) -> tuple[str, str | None]:
                       f"{live_path(cfg)} does not exist; refusing to start. "
                       "Create it (setu_exec.py enable-live) or set mode "
                       "back to 'simulate'.")
+    if mode == "live":
+        refusal = live_file_hygiene_refusal(cfg)
+        if refusal:
+            return mode, refusal
     return mode, None
 
 
@@ -293,6 +364,7 @@ class PlacedTracker:
     def __init__(self, cfg: dict):
         self.path = state_path(cfg)
         self.orders: dict[str, dict] = {}
+        self.transmissions: list[str] = []  # ISO times of live transmits
         self.load()
 
     def load(self) -> None:
@@ -300,15 +372,68 @@ class PlacedTracker:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(data, dict) and isinstance(data.get("placed"), dict):
                 self.orders = data["placed"]
+            brake = data.get("brake") if isinstance(data, dict) else None
+            if isinstance(brake, dict) and isinstance(brake.get("transmissions"), list):
+                self.transmissions = [str(t) for t in brake["transmissions"]]
         except (OSError, ValueError):
             self.orders = {}
+            self.transmissions = []
 
     def save(self) -> None:
         try:
             self.path.write_text(
-                json.dumps({"placed": self.orders}, indent=2), encoding="utf-8")
+                json.dumps({"placed": self.orders,
+                            "brake": {"transmissions": self.transmissions}},
+                           indent=2), encoding="utf-8")
         except OSError as exc:
             log(f"executor state save failed: {exc}")
+
+    # -- runaway brake (v0.2: accident insurance, not a trade cap) -----
+    def _transmission_times(self) -> list[datetime]:
+        out = []
+        for raw in self.transmissions:
+            try:
+                out.append(datetime.fromisoformat(raw))
+            except ValueError:
+                continue  # a corrupt entry never authorises anything
+        return out
+
+    def _prune_transmissions(self, now: datetime) -> None:
+        keep_after = now - timedelta(days=2)
+        times = [t for t in self._transmission_times() if t >= keep_after]
+        self.transmissions = [t.isoformat(timespec="seconds")
+                              for t in times[-500:]]
+
+    def record_transmission(self, when: datetime | None = None) -> None:
+        """Persist a live transmission BEFORE it is attempted, so a
+        crash mid-placement still counts against the brake."""
+        now = when or datetime.now(LONDON)
+        self.transmissions.append(now.isoformat(timespec="seconds"))
+        self._prune_transmissions(now)
+        self.save()
+
+    def placements_today(self, now: datetime | None = None) -> int:
+        now = now or datetime.now(LONDON)
+        return sum(1 for t in self._transmission_times()
+                   if t.date() == now.date())
+
+    def brake_check(self, now: datetime | None = None) -> tuple[bool, str]:
+        """(ok, reason). At most RUNAWAY_DAILY_CAP live placements
+        per London day, and at least RUNAWAY_MIN_SPACING_SECONDS
+        between any two live transmissions."""
+        now = now or datetime.now(LONDON)
+        times = self._transmission_times()
+        today = sum(1 for t in times if t.date() == now.date())
+        if today >= RUNAWAY_DAILY_CAP:
+            return False, (f"runaway brake: {today} live placements already "
+                           f"transmitted today (cap {RUNAWAY_DAILY_CAP}/day)")
+        if times:
+            gap = (now - max(times)).total_seconds()
+            if gap < RUNAWAY_MIN_SPACING_SECONDS:
+                return False, (f"runaway brake: last live transmission "
+                               f"{gap:.0f}s ago (< {RUNAWAY_MIN_SPACING_SECONDS:.0f}s "
+                               f"minimum spacing)")
+        return True, ""
 
     def add(self, row_id: str, record: dict) -> None:
         self.orders[str(row_id)] = record
@@ -381,7 +506,14 @@ class KuberaClient:
                 if isinstance(body.get(key), list):
                     rows = body[key]
                     break
-        return [normalise_row(r) for r in (rows or [])]
+        out = []
+        for r in (rows or []):
+            if not isinstance(r, dict):
+                # A malformed poll reply is a failed poll: never let
+                # one bad row crash the cycle halfway through it.
+                raise KuberaError(f"malformed staged-order row in poll reply: {r!r}")
+            out.append(normalise_row(r))
+        return out
 
     def post_event(self, row_id: str, kind: str, detail: dict) -> dict:
         return self._request(
@@ -406,6 +538,42 @@ def normalise_row(raw: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Live-mode Pushover via Varuna (v0.2). Simulate mode never notifies.
+# ---------------------------------------------------------------------------
+
+def build_pushover_request(cfg: dict, title: str, message: str):
+    """(url, headers, payload) for Varuna's Pushover route. Varuna
+    rides on the Kubera host at port 8400; executor.json may carry
+    "notify_base" to override the base outright."""
+    override = str(cfg.get("notify_base") or "").strip()
+    if override:
+        url = override.rstrip("/") + "/v1/vendors/pushover/send"
+    else:
+        host = urllib.parse.urlparse(str(cfg.get("kubera_base") or "")).hostname
+        url = f"http://{host}:8400/v1/vendors/pushover/send"
+    headers = {"Content-Type": "application/json",
+               "X-Varuna-Source": "Molang"}
+    payload = {"title": title, "message": message, "priority": 1}
+    return url, headers, payload
+
+
+def send_pushover(cfg: dict, title: str, message: str) -> bool:
+    """Best-effort: a failed notification never blocks or crashes
+    anything. Returns True only when the POST completed."""
+    url, headers, payload = build_pushover_request(cfg, title, message)
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+        return True
+    except Exception as exc:
+        log(f"pushover notify failed ({type(exc).__name__}: {exc})")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Gateway client (own client id; the ONLY place ibapi order calls exist)
 # ---------------------------------------------------------------------------
 
@@ -417,6 +585,8 @@ class ExecGateway:
         self.cfg = cfg
         self.account = str(cfg["account_id"])
         self.connected_event = threading.Event()
+        self.read_error: str | None = None  # set by an IB error mid-read
+        self._reading = False
         self.positions: dict[int, dict] = {}
         self.positions_event = threading.Event()
         self.open_orders: list[dict] = []
@@ -503,6 +673,11 @@ class ExecGateway:
                     slot["error"] = f"IB error {errorCode}: {errorString}"
                     slot["event"].set()
                 else:
+                    if outer._reading:
+                        # An error mid-read poisons the read: the
+                        # fetch aborts instead of trusting a partial
+                        # list or waiting out the full timeout.
+                        outer.read_error = f"IB error {errorCode}: {errorString}"
                     log(f"gateway error {errorCode}: {errorString}")
 
             def connectionClosed(self):
@@ -541,15 +716,34 @@ class ExecGateway:
             return False
 
     # -- live reads (G2: always fresh from the Gateway, never Kubera) ---
+    # A read is valid ONLY when its completion callback fires
+    # (positionEnd / openOrderEnd). A timeout, or any IB error while
+    # the read is in flight, returns None and the cycle aborts: gates
+    # are never evaluated against a partial list.
+    def _wait_read(self, event: threading.Event, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while not event.is_set():
+            if self.read_error:
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            event.wait(timeout=0.2)
+        return self.read_error is None
+
     def fetch_positions(self, timeout: float = 20.0) -> dict[int, dict] | None:
         self.positions = {}
+        self.read_error = None
+        self._reading = True
         self.positions_event.clear()
-        self.client.reqPositions()
         try:
-            if not self.positions_event.wait(timeout=timeout):
+            self.client.reqPositions()
+            if not self._wait_read(self.positions_event, timeout):
+                if self.read_error:
+                    log(f"positions read failed: {self.read_error}")
                 return None
             return dict(self.positions)
         finally:
+            self._reading = False
             try:
                 self.client.cancelPositions()
             except Exception:
@@ -558,10 +752,17 @@ class ExecGateway:
     def fetch_open_orders(self, timeout: float = 20.0) -> list[dict] | None:
         self.open_orders = []
         self.status_by_key = {}
+        self.read_error = None
+        self._reading = True
         self.open_orders_event.clear()
-        self.client.reqAllOpenOrders()
-        if not self.open_orders_event.wait(timeout=timeout):
-            return None
+        try:
+            self.client.reqAllOpenOrders()
+            if not self._wait_read(self.open_orders_event, timeout):
+                if self.read_error:
+                    log(f"open-orders read failed: {self.read_error}")
+                return None
+        finally:
+            self._reading = False
         self.last_status_by_perm = {
             int(k[1]): v for k, v in self.status_by_key.items() if k[0] == "p"}
         out = []
@@ -676,6 +877,7 @@ class Executor:
         self.gateway = gateway
         self.tracker = tracker if tracker is not None else PlacedTracker(cfg)
         self._noted: set[str] = set()
+        self._last_kill: bool | None = None  # kill state as last read
 
     def _note_once(self, key: str, msg: str) -> None:
         if key not in self._noted:
@@ -692,9 +894,18 @@ class Executor:
                                    "(setu_exec.py arm to arm)")
             return
         self._noted.discard("arm")
+        if self.mode == "live":
+            # Permissions can loosen while the daemon runs; re-check
+            # every cycle, not just at start.
+            refusal = live_file_hygiene_refusal(self.cfg)
+            if refusal:
+                self._note_once("hygiene", f"live file hygiene: {refusal}; idling")
+                return
+            self._noted.discard("hygiene")
         try:
             control = self.kubera.get_control()
         except KuberaError as exc:
+            self._last_kill = None
             if exc.status == 404:
                 self._note_once("kubera404", "staged-orders endpoints not "
                                              "deployed in Kubera yet; idling")
@@ -703,7 +914,19 @@ class Executor:
             return
         self._noted.discard("kubera404")
         self._noted.discard("kubera")
-        if control.get("kill_switch"):
+        # Fail-closed control (v0.2): the reply must be a dict whose
+        # kill_switch is a real bool. A missing key, a wrong type, or
+        # any other shape is treated exactly like a dead Kubera: idle.
+        # Proceeding on an unreadable kill switch is the one failure
+        # this program must never have.
+        if not isinstance(control, dict) or not isinstance(control.get("kill_switch"), bool):
+            self._last_kill = None
+            self._note_once("controlbad", f"Kubera control reply malformed "
+                                          f"({control!r:.120}); failing closed, idling")
+            return
+        self._noted.discard("controlbad")
+        self._last_kill = control["kill_switch"]
+        if control["kill_switch"]:
             self._note_once("kill", "kill switch is ON in Kubera; idling")
             return
         self._noted.discard("kill")
@@ -711,7 +934,9 @@ class Executor:
         positions = self.gateway.fetch_positions()
         open_orders = self.gateway.fetch_open_orders()
         if positions is None or open_orders is None:
-            log("live Gateway reads timed out; skipping this cycle")
+            log("live Gateway reads incomplete (no completion callback, "
+                "or an error mid-read); aborting this cycle — no gates "
+                "evaluated on partial data")
             return
 
         self.reconcile(open_orders)
@@ -783,16 +1008,41 @@ class Executor:
         except KuberaError as exc:
             log(f"event post failed for row {row_id} ({kind}): {exc}")
 
+    # -- live-mode notification (v0.2; simulate never notifies) -----------
+    def _notify(self, title: str, message: str) -> None:
+        if self.mode != "live":
+            return
+        send_pushover(self.cfg, title, message)
+
+    def _notify_refusal(self, row: dict, detail: dict) -> None:
+        line = order_line(row, row["quantity"], row["target_limit"] or 0)
+        self._notify("setu-exec: gate refusal",
+                     f"{self.account} {line} — refused at gate "
+                     f"[{detail.get('gate')}]: {detail.get('reason')}")
+
     # -- one staged row -------------------------------------------------------
-    def process_row(self, row: dict, positions: dict[int, dict],
-                    open_orders: list[dict]) -> None:
+    def process_row(self, row: dict, positions: dict[int, dict] | None,
+                    open_orders: list[dict] | None) -> None:
         self._report(row["id"], "placing", {"mode": self.mode})
+        if positions is None or open_orders is None:
+            # Defence in depth: cycle() already aborts on incomplete
+            # reads, but a row must never be gated on partial data.
+            detail = {"gate": "reads_incomplete",
+                      "reason": "live Gateway reads did not complete; "
+                                "refusing to evaluate gates on partial data"}
+            log(f"GATE FAILED [reads_incomplete] "
+                f"{order_line(row, row['quantity'], row['target_limit'] or 0)}"
+                f" — {detail['reason']}")
+            self._report(row["id"], "gate_failed", detail)
+            self._notify_refusal(row, detail)
+            return
         position = positions.get(int(row["con_id"]))
         ok, detail = evaluate_gates(row, position, open_orders)
         if not ok:
             log(f"GATE FAILED [{detail['gate']}] {order_line(row, row['quantity'], row['target_limit'] or 0)}"
                 f" — {detail['reason']}")
             self._report(row["id"], "gate_failed", detail)
+            self._notify_refusal(row, detail)
             return
         qty, limit = detail["effective_qty"], detail["limit"]
         line = order_line(row, qty, limit)
@@ -809,6 +1059,7 @@ class Executor:
         if not ok:
             log(f"GATE FAILED [whatif] {line} — {detail['reason']}")
             self._report(row["id"], "gate_failed", detail)
+            self._notify_refusal(row, detail)
             return
 
         if self.mode == "simulate":
@@ -818,15 +1069,27 @@ class Executor:
                 "effective_qty": qty})
             return
 
-        # Live mode: gates all passed, enable file verified at start.
+        # Live mode: gates all passed. Runaway brake last, at the one
+        # point where a transmission is about to happen (v0.2).
+        brake_ok, brake_reason = self.tracker.brake_check()
+        if not brake_ok:
+            detail = {"gate": "runaway_brake", "reason": brake_reason}
+            log(f"GATE FAILED [runaway_brake] {line} — {brake_reason}")
+            self._report(row["id"], "gate_failed", detail)
+            self._notify_refusal(row, detail)
+            return
         spec = build_order_spec(row, qty, limit, what_if=False)
         # Record BEFORE transmitting so a crash mid-placement leaves a
-        # trace the restart reconciliation can find by orderRef.
+        # trace the restart reconciliation can find by orderRef. The
+        # transmission itself is also counted before the attempt, so
+        # it counts against the runaway brake even if the process
+        # dies mid-call.
         self.tracker.add(row["id"], {
             "order_ref": str(row["id"]), "account": self.account,
             "confirmed": False, "broker_order_id": None, "perm_id": None,
             "last_status": "", "placed_at": datetime.now(LONDON).isoformat(timespec="seconds"),
             "order": spec})
+        self.tracker.record_transmission()
         try:
             result = self.gateway.transmit(spec)
         except Exception as exc:
@@ -842,6 +1105,9 @@ class Executor:
             # next-cycle reconciliation by orderRef resolves it. Never
             # a blind retry.
             log(f"PLACED (unconfirmed) {line} — no Gateway reply yet; tracking by orderRef")
+            self._notify("setu-exec: order placed (unconfirmed)",
+                         f"{self.account} {line} — transmitted, no Gateway "
+                         f"confirmation yet; tracked by orderRef")
             return
         self.tracker.update(row["id"], confirmed=True,
                             broker_order_id=result.get("order_id"),
@@ -851,6 +1117,9 @@ class Executor:
         self._report(row["id"], "placed", {
             "broker_order_id": result.get("order_id"),
             "perm_id": result.get("perm_id"), "order": spec})
+        self._notify("setu-exec: order placed",
+                     f"{self.account} {line} — PLACED order "
+                     f"{result.get('order_id')} perm {result.get('perm_id')}")
 
     # -- runners ---------------------------------------------------------------
     def run_forever(self) -> int:
@@ -879,6 +1148,13 @@ class Executor:
                 log(f"cycle error ({type(exc).__name__}: {exc}); reconnecting")
                 self.gateway.disconnect()
                 continue
+            # Posture, once per cycle in run mode (v0.2): the four
+            # facts that say whether this program could trade right
+            # now, with the kill state as last read by the cycle.
+            kill = self._last_kill if self._last_kill is not None else "unknown"
+            log(f"posture: mode={self.mode} armed={is_armed(self.cfg)} "
+                f"kill_switch={kill} "
+                f"placements_today={self.tracker.placements_today()}")
             time.sleep(poll)
 
     def run_once(self) -> int:
@@ -941,6 +1217,10 @@ def main() -> int:
     if args.command == "enable-live":
         live_path(cfg).write_text("live enabled " + london_today() + "\n",
                                   encoding="utf-8")
+        try:
+            os.chmod(live_path(cfg), 0o600)
+        except OSError:
+            pass  # the live hygiene check will refuse loudly if loose
         print(f"live enable file written: {live_path(cfg)}. "
               "Live mode also needs mode=live in executor.json, a daily "
               "arm, and the Kubera kill switch off.")

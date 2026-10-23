@@ -8,6 +8,7 @@ Run: python3 -m unittest discover tests
 """
 import copy
 import json
+import os
 import re
 import sys
 import tempfile
@@ -53,7 +54,12 @@ def make_cfg(tmp: str, mode="simulate", live_file=False) -> dict:
     }
     Path(tmp, "token").write_text("test-token", encoding="utf-8")
     if live_file:
-        Path(tmp, "executor.live").write_text("live\n", encoding="utf-8")
+        live = Path(tmp, "executor.live")
+        live.write_text("live\n", encoding="utf-8")
+        # Model a correctly secured machine (the live hygiene check
+        # refuses group/other-writable switch files; this sandbox's
+        # umask would otherwise create the fixture at 0o660).
+        os.chmod(live, 0o600)
     return cfg
 
 
@@ -490,6 +496,524 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(token, "test-token")
             self.assertTrue(body["detail"]["order"]["order"]["whatIf"])
             self.assertEqual(body["detail"]["effective_qty"], 3.0)
+
+
+# ---------------------------------------------------------------------------
+# v0.2.0 guardrail hardening tests
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+from unittest import mock  # noqa: E402
+
+ROW2 = {
+    "id": "row-456",
+    "account_id": "U19377323",
+    "con_id": 222,
+    "symbol": "XYZ",
+    "local_symbol": "XYZ   261120P00010000",
+    "expiry": "2026-11-20",
+    "strike": 10.0,
+    "option_type": "Put",
+    "quantity": 2.0,
+    "premium": 5.0,
+    "target_limit": 2.0,  # tick_round(0.40 * 5.0)
+}
+
+
+def short_position2(qty=-4.0, avg_cost=5.0):
+    return {"con_id": 222, "symbol": "XYZ", "quantity": qty,
+            "avg_cost": avg_cost}
+
+
+class ControlStubKubera(FakeKubera):
+    def __init__(self, control=None, exc=None, **kw):
+        super().__init__(**kw)
+        self._control = control
+        self._exc = exc
+
+    def get_control(self):
+        if self._exc is not None:
+            raise self._exc
+        return self._control
+
+
+class ControlFailClosedTests(unittest.TestCase):
+    """Item 1: ANY control-read failure or malformed reply idles the
+    cycle. Nothing is fetched, claimed, or placed."""
+
+    def _run(self, kubera):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = FakeGateway()
+            ex = make_executor(tmp, kubera=kubera, gateway=gw)
+            ex.cycle()
+            return kubera, gw
+
+    def test_control_exception_idles(self):
+        kubera, gw = self._run(ControlStubKubera(
+            exc=setu_exec.KuberaError("boom")))
+        self.assertEqual(kubera.events, [])
+        self.assertEqual(gw.fetch_count, 0)
+
+    def test_control_missing_kill_switch_key_idles(self):
+        kubera, gw = self._run(ControlStubKubera(control={}))
+        self.assertEqual(kubera.events, [])
+        self.assertEqual(gw.fetch_count, 0)
+
+    def test_control_non_bool_kill_switch_idles(self):
+        kubera, gw = self._run(ControlStubKubera(control={"kill_switch": 1}))
+        self.assertEqual(kubera.events, [])
+        self.assertEqual(gw.fetch_count, 0)
+
+    def test_control_non_dict_idles(self):
+        kubera, gw = self._run(ControlStubKubera(control=["kill_switch"]))
+        self.assertEqual(kubera.events, [])
+        self.assertEqual(gw.fetch_count, 0)
+
+    def test_control_false_proceeds(self):
+        kubera, gw = self._run(ControlStubKubera(
+            control={"account_id": "U19377323", "kill_switch": False}))
+        kinds = [k for _id, k, _d in kubera.events]
+        self.assertEqual(kinds, ["placing", "would_place"])
+
+
+class PollStubKubera(FakeKubera):
+    def poll_approved(self):
+        raise setu_exec.KuberaError("poll boom")
+
+
+class PollFailClosedTests(unittest.TestCase):
+    """Item 1 (poll half): a failed poll means no work that cycle."""
+
+    def test_failed_poll_places_nothing_in_live_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera, gw = PollStubKubera(), FakeGateway()
+            ex = make_executor(tmp, kubera=kubera, gateway=gw,
+                               mode="live", live_file=True)
+            ex.cycle()
+            self.assertEqual(kubera.events, [])
+            self.assertEqual(gw.whatif_specs, [])
+            self.assertEqual(gw.transmit_specs, [])
+
+    def test_malformed_poll_row_is_a_failed_poll(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            client = setu_exec.KuberaClient(cfg)
+            client._request = lambda *a, **k: {"orders": [dict(ROW), "junk"]}
+            with self.assertRaises(setu_exec.KuberaError):
+                client.poll_approved()
+
+    def test_poll_body_without_rows_is_empty_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            client = setu_exec.KuberaClient(cfg)
+            client._request = lambda *a, **k: {"unexpected": True}
+            self.assertEqual(client.poll_approved(), [])
+
+
+class FakeIBClient:
+    """Stands in for ibapi's EClient inside a real ExecGateway,
+    driving the real wrapper callbacks — complete or truncated."""
+
+    def __init__(self, gw, complete_positions=True, complete_orders=True,
+                 error_on_positions=False):
+        self.gw = gw
+        self.complete_positions = complete_positions
+        self.complete_orders = complete_orders
+        self.error_on_positions = error_on_positions
+
+    def reqPositions(self):
+        contract = SimpleNamespace(conId=843250654, multiplier="100",
+                                   secType="OPT", symbol="ASTS")
+        self.gw.wrapper.position("U19377323", contract, -5.0, 628.0)
+        if self.error_on_positions:
+            self.gw.wrapper.error(-1, 1100, "Connectivity lost")
+        if self.complete_positions:
+            self.gw.wrapper.positionEnd()
+
+    def cancelPositions(self):
+        pass
+
+    def reqAllOpenOrders(self):
+        contract = SimpleNamespace(conId=999)
+        order = SimpleNamespace(account="U19377323", permId=0,
+                                lmtPrice=None, orderRef="", action="BUY")
+        state = SimpleNamespace(status="Submitted")
+        self.gw.wrapper.openOrder(7, contract, order, state)
+        if self.complete_orders:
+            self.gw.wrapper.openOrderEnd()
+
+
+class ReadCompletionTests(unittest.TestCase):
+    """Item 2: a Gateway read counts only when its completion
+    callback fires (positionEnd / openOrderEnd). Truncated or
+    erroring reads return None so the cycle aborts."""
+
+    def _gateway(self, tmp, **kw):
+        gw = setu_exec.ExecGateway(make_cfg(tmp))
+        gw.client = FakeIBClient(gw, **kw)
+        return gw
+
+    def test_complete_reads_return_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = self._gateway(tmp)
+            positions = gw.fetch_positions(timeout=2.0)
+            self.assertIn(843250654, positions)
+            self.assertEqual(positions[843250654]["avg_cost"], 6.28)
+            orders = gw.fetch_open_orders(timeout=2.0)
+            self.assertEqual(len(orders), 1)
+
+    def test_truncated_positions_read_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = self._gateway(tmp, complete_positions=False)
+            self.assertIsNone(gw.fetch_positions(timeout=0.6))
+
+    def test_truncated_orders_read_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = self._gateway(tmp, complete_orders=False)
+            self.assertIsNone(gw.fetch_open_orders(timeout=0.6))
+
+    def test_error_mid_read_aborts_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = self._gateway(tmp, complete_positions=False,
+                               error_on_positions=True)
+            self.assertIsNone(gw.fetch_positions(timeout=5.0))
+            self.assertIsNotNone(gw.read_error)
+
+
+class IncompleteGateway(FakeGateway):
+    def fetch_positions(self):
+        return None
+
+
+class ReadsIncompleteRowTests(unittest.TestCase):
+    """Item 2 (executor half): incomplete reads abort the cycle
+    before any claim; a row handed partial reads is refused with
+    the reads_incomplete gate, never evaluated."""
+
+    def test_cycle_aborts_before_poll_on_incomplete_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera, gw = FakeKubera(), IncompleteGateway()
+            ex = make_executor(tmp, kubera=kubera, gateway=gw)
+            ex.cycle()
+            self.assertEqual(kubera.events, [])
+            self.assertEqual(gw.whatif_specs, [])
+            self.assertEqual(gw.transmit_specs, [])
+
+    def test_process_row_refuses_partial_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera, gw = FakeKubera(), FakeGateway()
+            ex = make_executor(tmp, kubera=kubera, gateway=gw)
+            ex.process_row(dict(ROW), None, [])
+            kinds = [k for _id, k, _d in kubera.events]
+            self.assertEqual(kinds, ["placing", "gate_failed"])
+            self.assertEqual(kubera.events[1][2]["gate"], "reads_incomplete")
+            self.assertEqual(gw.whatif_specs, [])
+
+
+class LimitPremiumGateTests(unittest.TestCase):
+    """Item 3: limit >= premium is corrupted input; refuse, naming
+    both numbers."""
+
+    def test_limit_below_premium_passes(self):
+        ok, _ = setu_exec.gate_limit_below_premium(ROW, 2.51)
+        self.assertTrue(ok)
+
+    def test_limit_equal_premium_refuses(self):
+        ok, detail = setu_exec.gate_limit_below_premium(ROW, 6.28)
+        self.assertFalse(ok)
+        self.assertEqual(detail["gate"], "limit_premium")
+        self.assertIn("6.28", detail["reason"])
+
+    def test_limit_above_premium_refuses(self):
+        row = dict(ROW, premium=2.0)
+        ok, detail = setu_exec.gate_limit_below_premium(row, 2.51)
+        self.assertFalse(ok)
+        self.assertIn("2.51", detail["reason"])
+        self.assertIn("2.0", detail["reason"])
+
+    def test_missing_numbers_refuse(self):
+        ok, _ = setu_exec.gate_limit_below_premium(dict(ROW, premium=None), 2.51)
+        self.assertFalse(ok)
+        ok, _ = setu_exec.gate_limit_below_premium(ROW, None)
+        self.assertFalse(ok)
+
+
+class RunawayBrakeTests(unittest.TestCase):
+    """Item 4: 60s spacing + 25/day from the state file. Accident
+    insurance on live transmissions; simulate is untouched."""
+
+    def test_spacing_blocks_second_live_placement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera, gw = FakeKubera(rows=[]), FakeGateway()
+            ex = make_executor(tmp, kubera=kubera, gateway=gw,
+                               mode="live", live_file=True)
+            ex.process_row(dict(ROW), {843250654: short_position()}, [])
+            ex.process_row(dict(ROW2), {222: short_position2()}, [])
+            self.assertEqual(len(gw.transmit_specs), 1)
+            failures = [d for _id, k, d in kubera.events if k == "gate_failed"]
+            self.assertEqual(len(failures), 1)
+            self.assertEqual(failures[0]["gate"], "runaway_brake")
+            self.assertIn("spacing", failures[0]["reason"])
+
+    def test_daily_cap_blocks_live_placement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp, mode="live", live_file=True)
+            arm(cfg)
+            tracker = setu_exec.PlacedTracker(cfg)
+            base = datetime.now(setu_exec.LONDON).replace(
+                hour=0, minute=1, second=0, microsecond=0)
+            tracker.transmissions = [
+                (base + timedelta(seconds=61 * i)).isoformat(timespec="seconds")
+                for i in range(setu_exec.RUNAWAY_DAILY_CAP)]
+            tracker.save()
+            kubera, gw = FakeKubera(rows=[]), FakeGateway()
+            ex = setu_exec.Executor(cfg, kubera, gw)
+            ex.process_row(dict(ROW), {843250654: short_position()}, [])
+            self.assertEqual(gw.transmit_specs, [])
+            failures = [d for _id, k, d in kubera.events if k == "gate_failed"]
+            self.assertEqual(failures[0]["gate"], "runaway_brake")
+
+    def test_brake_check_spacing_and_cap_reasons(self):
+        now = datetime(2026, 10, 23, 12, 0, tzinfo=setu_exec.LONDON)
+        with tempfile.TemporaryDirectory() as tmp:
+            tracker = setu_exec.PlacedTracker(make_cfg(tmp))
+            tracker.record_transmission(now - timedelta(seconds=30))
+            ok, reason = tracker.brake_check(now)
+            self.assertFalse(ok)
+            self.assertIn("spacing", reason)
+            ok, _ = tracker.brake_check(now + timedelta(seconds=31))
+            self.assertTrue(ok)
+            for i in range(setu_exec.RUNAWAY_DAILY_CAP):
+                tracker.record_transmission(now - timedelta(seconds=3600 + i))
+            ok, reason = tracker.brake_check(now)
+            self.assertFalse(ok)
+            self.assertIn("cap", reason)
+
+    def test_placements_today_counts_only_today(self):
+        now = datetime(2026, 10, 23, 12, 0, tzinfo=setu_exec.LONDON)
+        with tempfile.TemporaryDirectory() as tmp:
+            tracker = setu_exec.PlacedTracker(make_cfg(tmp))
+            tracker.record_transmission(now - timedelta(days=1))
+            tracker.record_transmission(now - timedelta(hours=2))
+            self.assertEqual(tracker.placements_today(now), 1)
+
+    def test_legacy_state_file_without_brake_section_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            setu_exec.state_path(cfg).write_text(json.dumps(
+                {"placed": {"row-9": {"order_ref": "row-9"}}}),
+                encoding="utf-8")
+            tracker = setu_exec.PlacedTracker(cfg)
+            self.assertIsNotNone(tracker.get("row-9"))
+            self.assertEqual(tracker.placements_today(), 0)
+            ok, _ = tracker.brake_check()
+            self.assertTrue(ok)
+
+    def test_simulate_ignores_the_brake(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            arm(cfg)
+            tracker = setu_exec.PlacedTracker(cfg)
+            tracker.record_transmission()  # a transmission seconds ago
+            kubera, gw = FakeKubera(), FakeGateway()
+            ex = setu_exec.Executor(cfg, kubera, gw, tracker=tracker)
+            ex.cycle()
+            kinds = [k for _id, k, _d in kubera.events]
+            self.assertEqual(kinds, ["placing", "would_place"])
+
+
+class PushoverTests(unittest.TestCase):
+    """Item 5: live mode notifies placements and gate refusals via
+    Varuna's Pushover route; simulate never notifies; a failed
+    notify changes nothing."""
+
+    def test_request_shape_and_host_derivation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            cfg["kubera_base"] = "http://100.125.239.56:8000"
+            url, headers, payload = setu_exec.build_pushover_request(
+                cfg, "T", "M")
+            self.assertEqual(
+                url, "http://100.125.239.56:8400/v1/vendors/pushover/send")
+            self.assertEqual(headers["X-Varuna-Source"], "Molang")
+            self.assertEqual(payload, {"title": "T", "message": "M",
+                                       "priority": 1})
+
+    def test_notify_base_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            cfg["notify_base"] = "http://notify.example:9999/"
+            url, _h, _p = setu_exec.build_pushover_request(cfg, "T", "M")
+            self.assertEqual(
+                url, "http://notify.example:9999/v1/vendors/pushover/send")
+
+    def test_failed_notify_is_swallowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            with mock.patch.object(setu_exec.urllib.request, "urlopen",
+                                   side_effect=OSError("down")):
+                self.assertFalse(setu_exec.send_pushover(cfg, "T", "M"))
+
+    def test_successful_notify_posts_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            captured = {}
+
+            class Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    return b"{}"
+
+            def fake_urlopen(req, timeout=None):
+                captured["url"] = req.full_url
+                captured["body"] = json.loads(req.data.decode())
+                captured["source"] = req.get_header("X-varuna-source")
+                return Resp()
+
+            with mock.patch.object(setu_exec.urllib.request, "urlopen",
+                                   fake_urlopen):
+                self.assertTrue(setu_exec.send_pushover(cfg, "T", "M"))
+            self.assertEqual(captured["body"]["priority"], 1)
+            self.assertEqual(captured["source"], "Molang")
+
+    def test_live_placement_notifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            with mock.patch.object(
+                    setu_exec, "send_pushover",
+                    lambda cfg, t, m: calls.append((t, m)) or True):
+                kubera, gw = FakeKubera(), FakeGateway()
+                ex = make_executor(tmp, kubera=kubera, gateway=gw,
+                                   mode="live", live_file=True)
+                ex.cycle()
+            self.assertEqual(len(calls), 1)
+            self.assertIn("U19377323", calls[0][1])
+            self.assertIn("ASTS", calls[0][1])
+            self.assertIn("PLACED", calls[0][1])
+
+    def test_live_gate_refusal_notifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            with mock.patch.object(
+                    setu_exec, "send_pushover",
+                    lambda cfg, t, m: calls.append((t, m)) or True):
+                kubera = FakeKubera()
+                gw = FakeGateway(position=None)
+                ex = make_executor(tmp, kubera=kubera, gateway=gw,
+                                   mode="live", live_file=True)
+                ex.cycle()
+            self.assertEqual(len(calls), 1)
+            self.assertIn("position", calls[0][1])
+
+    def test_simulate_never_notifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+            with mock.patch.object(
+                    setu_exec, "send_pushover",
+                    lambda cfg, t, m: calls.append((t, m)) or True):
+                kubera, gw = FakeKubera(), FakeGateway()
+                ex = make_executor(tmp, kubera=kubera, gateway=gw)
+                ex.cycle()
+                # and a refusal in simulate stays silent too
+                kubera2 = FakeKubera()
+                ex2 = make_executor(tmp, kubera=kubera2,
+                                    gateway=FakeGateway(position=None))
+                ex2.cycle()
+            self.assertEqual(calls, [])
+
+
+class FileHygieneTests(unittest.TestCase):
+    """Item 6: live mode refuses while executor.json or
+    executor.live is group/other-writable."""
+
+    def test_loose_executor_json_refuses_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp, mode="live", live_file=True)
+            loose = Path(tmp, "executor.json")
+            loose.write_text('{"mode": "live"}', encoding="utf-8")
+            os.chmod(loose, 0o666)
+            _mode, refusal = setu_exec.resolve_mode(cfg)
+            self.assertIsNotNone(refusal)
+            self.assertIn("executor.json", refusal)
+
+    def test_loose_live_file_refuses_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp, mode="live", live_file=True)
+            os.chmod(Path(tmp, "executor.live"), 0o777)
+            _mode, refusal = setu_exec.resolve_mode(cfg)
+            self.assertIsNotNone(refusal)
+            self.assertIn("executor.live", refusal)
+
+    def test_tight_files_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp, mode="live", live_file=True)
+            tight = Path(tmp, "executor.json")
+            tight.write_text('{"mode": "live"}', encoding="utf-8")
+            os.chmod(tight, 0o600)
+            _mode, refusal = setu_exec.resolve_mode(cfg)
+            self.assertIsNone(refusal)
+
+    def test_simulate_ignores_loose_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp, mode="simulate")
+            loose = Path(tmp, "executor.json")
+            loose.write_text('{"mode": "simulate"}', encoding="utf-8")
+            os.chmod(loose, 0o666)
+            mode, refusal = setu_exec.resolve_mode(cfg)
+            self.assertEqual((mode, refusal), ("simulate", None))
+
+    def test_cycle_recheck_catches_mid_run_loosening(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera, gw = FakeKubera(), FakeGateway()
+            ex = make_executor(tmp, kubera=kubera, gateway=gw,
+                               mode="live", live_file=True)
+            os.chmod(Path(tmp, "executor.live"), 0o777)  # loosened after start
+            ex.cycle()
+            self.assertEqual(kubera.events, [])
+            self.assertEqual(gw.fetch_count, 0)
+
+
+class _StopLoop(Exception):
+    pass
+
+
+class ConnectedGateway(FakeGateway):
+    def is_connected(self):
+        return True
+
+    def connect(self):
+        return True
+
+    def disconnect(self):
+        pass
+
+
+class PostureLineTests(unittest.TestCase):
+    """Item 7: one posture line per cycle in run mode carrying
+    mode, armed state, kill state and placements today."""
+
+    def test_posture_line_once_per_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = []
+            kubera, gw = FakeKubera(), ConnectedGateway()
+            ex = make_executor(tmp, kubera=kubera, gateway=gw)
+            with mock.patch.object(setu_exec, "log", lines.append), \
+                    mock.patch.object(setu_exec.time, "sleep",
+                                      side_effect=_StopLoop):
+                with self.assertRaises(_StopLoop):
+                    ex.run_forever()
+            posture = [ln for ln in lines if ln.startswith("posture:")]
+            self.assertEqual(len(posture), 1)
+            self.assertIn("mode=simulate", posture[0])
+            self.assertIn("armed=True", posture[0])
+            self.assertIn("kill_switch=False", posture[0])
+            self.assertIn("placements_today=0", posture[0])
 
 
 if __name__ == "__main__":
