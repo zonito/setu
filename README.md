@@ -80,6 +80,58 @@ for cost basis, realised profit, tax and history, and the feeds
 never write to it. The feeds answer "what is true right now"; the
 ledger answers "what happened".
 
+## setu-exec — the guarded GTC executor (`setu_exec.py`)
+
+A **separate program** from the read daemon, with its own Gateway
+client id (91) and its own LaunchAgent (`com.molang.setu-exec`,
+installed by `./exec-install.sh`). Setu itself stays incapable of
+placing orders; the executor is the only component that can, and it
+does exactly one job: take Kubera staged orders Zonito has APPROVED
+(buy-to-close limits for short options at the 60% take-profit price),
+revalidate them live, and report the outcome back to Kubera.
+
+**Modes** live in `~/.setu/executor.json` (the read daemon's
+`config.json` is never touched):
+
+- `"simulate"` — the default and the starting mode. Every gate runs,
+  including the Gateway what-if preview, and the executor reports
+  `would_place`. Simulate is incapable of transmitting: its only
+  order call carries `whatIf=True`.
+- `"live"` — after the same gates, the same order is transmitted
+  with `whatIf=False`. Live additionally requires the enable file
+  `~/.setu/executor.live` to exist; mode `live` without it refuses
+  to start. (`setu_exec.py enable-live` / `disable-live` manage it.)
+
+**Daily ritual:** the executor also needs a fresh arm every day —
+`~/.setu/venv/bin/python ~/.setu/setu_exec.py arm` writes today's
+date (Europe/London) into `~/.setu/executor.armed`; yesterday's arm
+never works, and `disarm` removes it. Kubera's per-account kill
+switch is read fresh every cycle and idles the executor while on.
+
+**Gates, in order, every placement:** armed → kill switch off →
+fresh live reads from the Gateway (never Kubera snapshots) → the
+short position is real and at least as large as asked (a smaller
+short closes what exists, flagged) → no duplicate (nothing carrying
+this row's `orderRef`, no working buy on the contract at the same
+price) → price sane (target = 0.40 × premium tick-rounded, premium
+within 10% of the live per-unit average cost) → frozen order shape
+(BUY / LMT / GTC / regular hours / single leg — nothing else can be
+constructed) → what-if preview succeeds and does not materially
+increase initial margin. Any failure is reported to Kubera as
+`gate_failed` with the gate named. There are deliberately **no
+quantity caps** (dropped 2026-10-23); the gates carry the safety.
+
+**Placed orders are tracked** in `~/.setu/executor-state.json` and
+followed to a terminal status (`filled` / `cancelled` / `rejected`
+reported back). On a restart, tracked orders are reconciled by
+`orderRef` against live open orders before anything new runs, so a
+crash mid-placement can never double-place a row.
+
+**Purpose of the dry run:** simulate mode exists so a run of
+`WOULD PLACE` lines can be reconciled against the GTC orders placed
+by hand in the portal, proving the gates agree with human judgement
+before live mode is enabled.
+
 ## Config — `~/.setu/config.json`
 
 | Key | Meaning |
@@ -114,7 +166,8 @@ ledger answers "what happened".
 
 ## Growth path
 
-Positions snapshots landed in v0.2.0. Next: executions (fills stream
-in real time, no more CSV), then what-if margin checks for the wheel
-pipeline. The ingest side of Kubera grows a new endpoint per step;
-Setu grows a new reader.
+Positions snapshots landed in v0.2.0. The guarded GTC executor
+(setu-exec, above) landed as a separate program in simulate-first
+form. Next: executions (fills stream in real time, no more CSV).
+The ingest side of Kubera grows a new endpoint per step; Setu grows
+a new reader.
