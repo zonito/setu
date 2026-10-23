@@ -244,6 +244,16 @@ class OrderSpecTests(unittest.TestCase):
         self.assertEqual(o["lmtPrice"], 2.51)
         self.assertEqual(o["totalQuantity"], 3.0)
 
+    def test_ib_objects_disable_etradeonly_and_firmquoteonly(self):
+        # Regression (live, 2026-10-23): ibapi defaults both to True and
+        # current IBKR servers reject eTradeOnly with error 10268.
+        gw = setu_exec.ExecGateway.__new__(setu_exec.ExecGateway)
+        gw.account = "U19377323"
+        spec = setu_exec.build_order_spec(ROW, 3.0, 2.51, what_if=True)
+        _contract, order = gw._ib_objects(spec)
+        self.assertFalse(order.eTradeOnly)
+        self.assertFalse(order.firmQuoteOnly)
+
     def test_live_spec_equals_simulate_except_whatif(self):
         sim = setu_exec.build_order_spec(ROW, 2.0, 2.51, what_if=True)
         live = setu_exec.build_order_spec(ROW, 2.0, 2.51, what_if=False)

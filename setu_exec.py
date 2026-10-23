@@ -593,6 +593,11 @@ class ExecGateway:
         order.orderRef = os_["orderRef"]
         order.transmit = bool(os_["transmit"])
         order.whatIf = bool(os_["whatIf"])
+        # ibapi 9.81 defaults eTradeOnly/firmQuoteOnly to True and always
+        # sends them; current IBKR servers reject eTradeOnly outright
+        # (error 10268, proven live 2026-10-23). Never wanted here.
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
         return contract, order
 
     def _await_slot(self, order_id: int, timeout: float) -> dict:
