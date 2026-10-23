@@ -122,20 +122,25 @@ def gate_position(row: dict, position: dict | None) -> tuple[bool, dict]:
 
 
 def gate_duplicate(row: dict, open_orders: list[dict], limit: float) -> tuple[bool, dict]:
-    """G4: never a second working buy on this contract at this price,
-    and never anything carrying this row's orderRef."""
+    """G4: never a second working BUY on this contract at ANY price,
+    and never anything carrying this row's orderRef. One short position
+    carries exactly one resting buy-to-close in this system; a portal
+    GTC placed by hand counts, whatever its price (strengthened
+    2026-10-23 after the first live rehearsal: every short in
+    U19377323 already had a hand-placed GTC at a non-40% price, which
+    a same-price check would have sailed past)."""
     ref = str(row["id"])
     for o in open_orders or []:
         if str(o.get("order_ref") or "") == ref:
             return False, {"gate": "duplicate",
                            "reason": f"an open order already carries orderRef {ref}"}
         if (int(o.get("con_id") or 0) == int(row["con_id"])
-                and str(o.get("action") or "") == "BUY"
-                and o.get("limit_price") is not None
-                and abs(float(o["limit_price"]) - float(limit)) < 1e-9):
+                and str(o.get("action") or "") == "BUY"):
             return False, {"gate": "duplicate",
                            "reason": f"working BUY on con_id {row['con_id']} "
-                                     f"at {limit} already exists"}
+                                     f"already exists at {o.get('limit_price')} "
+                                     f"(staged target was {limit}); replacing a "
+                                     f"resting order is a human decision"}
     return True, {}
 
 

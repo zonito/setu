@@ -164,10 +164,17 @@ class GateDuplicateTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(detail["gate"], "duplicate")
 
-    def test_other_price_or_side_passes(self):
+    def test_buy_at_any_price_on_same_contract_is_duplicate(self):
+        # The 2026-10-23 live-data lesson: a hand-placed portal GTC at
+        # a non-40% price must still block a staged placement.
+        orders = [{"con_id": 843250654, "action": "BUY", "limit_price": 1.50,
+                   "order_ref": "", "status": "Submitted"}]
+        ok, detail = setu_exec.gate_duplicate(ROW, orders, 2.51)
+        self.assertFalse(ok)
+        self.assertEqual(detail["gate"], "duplicate")
+
+    def test_other_side_or_contract_passes(self):
         orders = [
-            {"con_id": 843250654, "action": "BUY", "limit_price": 2.40,
-             "order_ref": "", "status": "Submitted"},
             {"con_id": 843250654, "action": "SELL", "limit_price": 2.51,
              "order_ref": "", "status": "Submitted"},
             {"con_id": 999, "action": "BUY", "limit_price": 2.51,
