@@ -1,11 +1,12 @@
 # Setu — the bridge between IB Gateway and Kubera
 
 Setu is a small, read-only daemon that sits next to IB Gateway on the
-same machine. Every minute it pulls account values and open orders
-over the local Gateway API socket and pushes them to Kubera's broker
-ingest endpoints — the same contracts the IBKR Enhancer userscript
-uses, so Kubera's diffing, GTC coverage checks and Pushover margin
-alerts keep working unchanged, with no browser tab to keep alive.
+same machine. Every minute it pulls account values, open orders and
+(v0.2.0) the live portfolio over the local Gateway API socket and
+pushes them to Kubera's broker ingest endpoints — the same contracts
+the IBKR Enhancer userscript uses, so Kubera's diffing, GTC coverage
+checks and Pushover margin alerts keep working unchanged, with no
+browser tab to keep alive.
 
 Setu **never places, cancels or modifies an order**. It only reads:
 the account summary, and all open orders for one configured account
@@ -35,6 +36,49 @@ After install, daily life is: **log in to IBKR Gateway. Done.** Setu
 reconnects to the Gateway on its own (backoff up to a minute), pushes
 changed values within a minute, and heartbeats unchanged values every
 5 minutes so Kubera never shows the feed stale while Setu is alive.
+
+## Positions feed (v0.2.0)
+
+Setu subscribes to the Gateway's account-updates stream for the
+configured account only (`reqAccountUpdates`). Portfolio updates land
+in a positions set keyed by contract id; whenever the mapped set
+changes (or on the 5-minute heartbeat) Setu pushes:
+
+```
+POST /api/v1/broker-positions/snapshot
+{ "account_id": "U…", "ingest_source": "setu",
+  "captured_at": "2026-10-23T09:00:00+01:00", "complete": true,
+  "positions": [ { "con_id": 265598, "symbol": "ACME",
+                   "local_symbol": "ACME", "sec_type": "STK",
+                   "expiry": null, "strike": null, "option_type": null,
+                   "multiplier": 1, "currency": "USD",
+                   "exchange": "NASDAQ", "quantity": 150.0,
+                   "avg_cost": 180.40, "market_price": 201.25,
+                   "market_value": 30187.5, "unrealized_pnl": 3127.5,
+                   "realized_pnl": 0.0 }, … ] }
+```
+
+Quantities are signed (shorts negative). `avg_cost` is the raw
+per-unit value IBKR reports, never scaled by the multiplier. Option
+expiry is ISO (`YYYY-MM-DD`), `option_type` is `Put`/`Call`.
+
+The same stream also fills the account snapshot's `unrealized_pnl`,
+`realized_pnl` and `settled_cash` when the account-summary sweep
+leaves them null on a login; a real sweep value always wins. (On the
+stream these arrive as `$LEDGER-UnrealizedPnL` / `$LEDGER-RealizedPnL`
+and a by-date `SettledCashByDate` breakdown, whose latest date Setu
+parses — verified live against the real Gateway.)
+
+**404-tolerant:** the Kubera positions endpoint is deployed
+separately. Until it exists, Setu logs one line ("positions endpoint
+not deployed yet"), keeps retrying quietly on change/heartbeat, and
+the accounts and orders feeds are never disturbed.
+
+**Layered design rule:** the broker feeds are a live mirror held in
+their own store. The transactions ledger stays the book of record
+for cost basis, realised profit, tax and history, and the feeds
+never write to it. The feeds answer "what is true right now"; the
+ledger answers "what happened".
 
 ## Config — `~/.setu/config.json`
 
@@ -70,7 +114,7 @@ changed values within a minute, and heartbeats unchanged values every
 
 ## Growth path
 
-Positions snapshots, then executions (fills stream in real time, no
-more CSV), then what-if margin checks for the wheel pipeline. The
-ingest side of Kubera grows a new endpoint per step; Setu grows a new
-reader.
+Positions snapshots landed in v0.2.0. Next: executions (fills stream
+in real time, no more CSV), then what-if margin checks for the wheel
+pipeline. The ingest side of Kubera grows a new endpoint per step;
+Setu grows a new reader.

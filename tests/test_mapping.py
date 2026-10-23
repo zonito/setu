@@ -125,6 +125,162 @@ class OrdersSnapshotTests(unittest.TestCase):
         self.assertEqual(snap["orders"], [])
 
 
+def pos_contract(**kw):
+    base = {"conId": 0, "symbol": "", "localSymbol": "", "secType": "STK",
+            "lastTradeDateOrContractMonth": "", "strike": 0.0, "right": "",
+            "multiplier": "", "currency": "USD", "primaryExchange": ""}
+    base.update(kw)
+    return base
+
+
+def pos_values(**kw):
+    base = {"position": 0.0, "marketPrice": 0.0, "marketValue": 0.0,
+            "averageCost": 0.0, "unrealizedPNL": 0.0, "realizedPNL": 0.0}
+    base.update(kw)
+    return base
+
+
+class PositionMappingTests(unittest.TestCase):
+    def test_stock_position(self):
+        p = setu.broker_position(
+            pos_contract(conId=265598, symbol="ACME", localSymbol="ACME",
+                         secType="STK", primaryExchange="NASDAQ"),
+            pos_values(position=150.0, marketPrice=201.25,
+                       marketValue=30187.5, averageCost=180.40,
+                       unrealizedPNL=3127.5, realizedPNL=0.0))
+        self.assertEqual(p["con_id"], 265598)
+        self.assertEqual(p["symbol"], "ACME")
+        self.assertEqual(p["local_symbol"], "ACME")
+        self.assertEqual(p["sec_type"], "STK")
+        self.assertIsNone(p["expiry"])
+        self.assertIsNone(p["strike"])
+        self.assertIsNone(p["option_type"])
+        self.assertEqual(p["multiplier"], 1)
+        self.assertEqual(p["currency"], "USD")
+        self.assertEqual(p["exchange"], "NASDAQ")
+        self.assertEqual(p["quantity"], 150.0)
+        self.assertEqual(p["avg_cost"], 180.40,
+                         "avg_cost is the raw per-unit value, never scaled")
+        self.assertEqual(p["market_price"], 201.25)
+        self.assertEqual(p["market_value"], 30187.5)
+        self.assertEqual(p["unrealized_pnl"], 3127.5)
+
+    def test_long_call(self):
+        p = setu.broker_position(
+            pos_contract(conId=700001, symbol="ACME", secType="OPT",
+                         lastTradeDateOrContractMonth="20270115",
+                         strike=55.0, right="C", multiplier="100"),
+            pos_values(position=2.0, marketPrice=3.10, marketValue=620.0,
+                       averageCost=250.0, unrealizedPNL=120.0))
+        self.assertEqual(p["sec_type"], "OPT")
+        self.assertEqual(p["expiry"], "2027-01-15")
+        self.assertEqual(p["strike"], 55.0)
+        self.assertEqual(p["option_type"], "Call")
+        self.assertEqual(p["multiplier"], 100)
+        self.assertEqual(p["quantity"], 2.0)
+        self.assertEqual(p["avg_cost"], 250.0)
+
+    def test_short_put_negative_quantity(self):
+        p = setu.broker_position(
+            pos_contract(conId=700002, symbol="MU", secType="OPT",
+                         lastTradeDateOrContractMonth="20261120",
+                         strike=120.0, right="P", multiplier="100"),
+            pos_values(position=-3.0, marketPrice=1.45,
+                       marketValue=-435.0, averageCost=180.0,
+                       unrealizedPNL=105.0, realizedPNL=0.0))
+        self.assertEqual(p["option_type"], "Put")
+        self.assertEqual(p["expiry"], "2026-11-20")
+        self.assertEqual(p["quantity"], -3.0, "shorts stay negative")
+        self.assertEqual(p["market_value"], -435.0)
+
+    def test_expiry_conversion(self):
+        p = setu.broker_position(
+            pos_contract(conId=1, symbol="X", secType="OPT",
+                         lastTradeDateOrContractMonth="20261218",
+                         strike=10.0, right="C", multiplier="100"),
+            pos_values(position=1.0))
+        self.assertEqual(p["expiry"], "2026-12-18")
+        p2 = setu.broker_position(
+            pos_contract(conId=2, symbol="X", secType="STK"),
+            pos_values(position=1.0))
+        self.assertIsNone(p2["expiry"], "no date on the contract -> null")
+
+    def test_blank_multiplier_defaults_to_1(self):
+        for blank in ("", None, 0, "0"):
+            p = setu.broker_position(
+                pos_contract(conId=3, symbol="X", secType="STK", multiplier=blank),
+                pos_values(position=1.0))
+            self.assertEqual(p["multiplier"], 1, f"multiplier {blank!r} -> 1")
+        p = setu.broker_position(
+            pos_contract(conId=4, symbol="X", secType="OPT", multiplier="100",
+                         right="P", strike=5.0,
+                         lastTradeDateOrContractMonth="20270115"),
+            pos_values(position=1.0))
+        self.assertEqual(p["multiplier"], 100)
+
+    def test_right_mapping(self):
+        for right, want in (("P", "Put"), ("C", "Call"), ("", None)):
+            p = setu.broker_position(
+                pos_contract(conId=5, symbol="X", secType="OPT", right=right,
+                             strike=5.0, multiplier="100",
+                             lastTradeDateOrContractMonth="20270115"),
+                pos_values(position=1.0))
+            self.assertEqual(p["option_type"], want)
+
+    def test_positions_snapshot_envelope(self):
+        snap = setu.positions_snapshot("U19377323", None,
+                                       "2026-10-23T09:00:00+01:00", [])
+        self.assertEqual(snap["ingest_source"], "setu")
+        self.assertEqual(snap["account_id"], "U19377323")
+        self.assertTrue(snap["complete"])
+        self.assertEqual(snap["positions"], [])
+
+
+class StreamFoldTests(unittest.TestCase):
+    def test_stream_fills_only_nulls(self):
+        merged = setu.fold_stream_values(
+            {"UnrealizedPnL": None, "RealizedPnL": 100.0, "SettledCash": None},
+            {"UnrealizedPnL": -42.5, "RealizedPnL": 999.0, "SettledCash": 1234.0})
+        self.assertEqual(merged["UnrealizedPnL"], -42.5)
+        self.assertEqual(merged["RealizedPnL"], 100.0,
+                         "a real sweep value always wins over the stream")
+        self.assertEqual(merged["SettledCash"], 1234.0)
+
+    def test_stream_missing_leaves_null(self):
+        merged = setu.fold_stream_values({"UnrealizedPnL": None}, {})
+        self.assertIsNone(merged["UnrealizedPnL"])
+
+    def test_settled_cash_by_date_parsing(self):
+        self.assertEqual(
+            setu.settled_cash_from_by_date("20261023:-99048.28"), -99048.28)
+        self.assertEqual(
+            setu.settled_cash_from_by_date("20261022:100.0,20261023:-5.5"), -5.5,
+            "latest date wins")
+        self.assertIsNone(setu.settled_cash_from_by_date(""))
+        self.assertIsNone(setu.settled_cash_from_by_date(None))
+        self.assertIsNone(setu.settled_cash_from_by_date("garbage"))
+        self.assertIsNone(setu.settled_cash_from_by_date("20261023:notanumber"))
+
+    def test_stream_key_spellings(self):
+        try:
+            client = setu.GatewayClient(
+                {"account_id": "U19377323", "ib_host": "127.0.0.1",
+                 "ib_port": 4001, "client_id": 99})
+        except Exception:
+            self.skipTest("ibapi unavailable")
+        w = client.wrapper
+        w.updateAccountValue("$LEDGER-UnrealizedPnL", "-237812.38", "USD", "U19377323")
+        w.updateAccountValue("$LEDGER-RealizedPnL", "0.00", "USD", "U19377323")
+        w.updateAccountValue("SettledCashByDate", "20261023:-99048.28", "USD", "U19377323")
+        w.updateAccountValue("NetLiquidation", "411092.99", "USD", "U19377323")
+        w.updateAccountValue("$LEDGER-UnrealizedPnL", "1.0", "USD", "U99999999")
+        self.assertEqual(client.stream_values["UnrealizedPnL"], -237812.38)
+        self.assertEqual(client.stream_values["RealizedPnL"], 0.0)
+        self.assertEqual(client.stream_values["SettledCash"], -99048.28)
+        self.assertNotIn("NetLiquidation", client.stream_values,
+                         "only the fill tags are captured from the stream")
+
+
 class ReadOnlyTests(unittest.TestCase):
     def test_no_order_placement_calls(self):
         src = Path(setu.__file__).read_text(encoding="utf-8")
