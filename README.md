@@ -132,6 +132,41 @@ crash mid-placement can never double-place a row.
 by hand in the portal, proving the gates agree with human judgement
 before live mode is enabled.
 
+### Cancel rows (setu-exec v0.3.0)
+
+Staged rows may also carry `action: "cancel"` (contract:
+`docs/kubera-cancel-contract.md`). A cancel row names ONE working
+order — by the broker-orders feed's order id, which is the order's
+perm id — plus the contract identity copied from the feed at raise
+time. Kubera's orphan scanner auto-raises these rows for orders the
+coverage check flags as orphans; Zonito approves each one (Phase 1).
+
+**Cancel gates, in order:** target still working (absent is a
+terminal no-op, `already_gone`, never a refusal) → identity match on
+con_id and action → verified completely unfilled (a partial fill is
+a human decision) → orphan premise re-check for scanner rows (if a
+position has appeared behind the order, the premise changed: refuse)
+→ never this program's own placed orders via a scanner row. There is
+no what-if for a cancel, so simulate stops at the gates and reports
+`would_execute`. Live mode transmits the cancel under the same
+runaway brake as placements, then verifies on a FRESH open-orders
+read that the target is actually gone before reporting `executed`.
+Every cancel, approved or (later) bypassed, lives as a staged row
+and files into Kubera's Closed ledger — no row, no execution, ever.
+
+**One extra Gateway setup step for cancels:** cancelling an order
+placed by another client requires this executor's client id (91) to
+be the account's **Master API Client ID** (Gateway → Configure →
+Settings → API → Settings). Without it the Gateway refuses with
+error 10147, which the executor surfaces verbatim as the row's
+failure reason. The first live cancel is the proof of the setting.
+
+**Phase 2 (after confidence):** when the `cancel_streak` counter in
+`executor-state.json` — reported in every `executed` event — reaches
+the agreed bar, Kubera may stamp scanner rows
+`approval_mode: "bypass"` and approve them without a human wait. The
+executor treats those rows identically; every gate still applies.
+
 ## Config — `~/.setu/config.json`
 
 | Key | Meaning |

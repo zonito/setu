@@ -60,6 +60,32 @@ account):
     transient what-if timeout refused a row before live ever
     saw it. Live gate_failed behaviour is unchanged.
 
+v0.3.0 (2026-10-25): a second staged action — cancel.
+  * Kubera staged rows may now carry action="cancel" (contract:
+    docs/kubera-cancel-contract.md). A cancel row names ONE working
+    order by its feed order id (the perm id) plus the contract
+    identity copied from the broker-orders feed at raise time.
+  * Cancel gates, in order: live reads complete -> target still
+    working (absent is a terminal no-op, "already_gone", never a
+    refusal) -> identity match -> verified unfilled -> orphan
+    premise re-check (scanner-raised rows only) -> never this
+    program's own placed orders (unless the row is a manual human
+    decision). Then the shared runaway brake, then the cancel.
+  * There is no what-if for a cancel, so simulate mode stops at
+    the gates and reports "would_execute". Live mode transmits the
+    cancel, then verifies on a FRESH open-orders read that the
+    target is actually gone before reporting "executed".
+  * Cancelling an order placed by another client can be refused
+    by the Gateway (error 10147) unless this client id is the
+    account's Master API client id; the refusal is surfaced
+    verbatim, never retried blindly. Setup: Master API Client
+    ID = 91 on both Gateways (see README).
+  * A clean-execution streak for cancel rows is kept in the
+    state file and reported in every "executed" event: it is the
+    counter Kubera's Phase-2 auto-approval ("after confidence")
+    reads. Transmit or verification failures reset it; premise
+    refusals and already_gone outcomes do not touch it.
+
 v0.2.2 (2026-10-23):
   * The Pushover notify POST goes through a dedicated opener
     with an explicitly empty proxy map. v0.2.1's investigation
@@ -101,7 +127,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -461,6 +487,161 @@ def order_line(row: dict, qty: float, limit: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cancel gates (v0.3, unit-tested in tests/test_cancel_gates.py)
+#
+# A cancel row is a plain dict: the placement fields that identify the
+# CONTRACT (con_id, symbol, expiry, strike, option_type) plus
+# target_order_id (the broker-orders feed's order id = the target
+# order's perm id), target_action / target_quantity /
+# target_limit_price copied from the feed at raise time, reason,
+# source ("orphan_scan" | "manual" | ...) and approval_mode
+# ("manual" | "bypass").
+# A live open order additionally carries (v0.3) "order_id" (the
+# session order id in the placing client's space) and
+# "filled"/"remaining" merged from the orderStatus callbacks.
+# ---------------------------------------------------------------------------
+
+def find_target_order(row: dict, open_orders: list[dict]) -> dict | None:
+    """Locate the live order a cancel row targets. The feed's order
+    id is the perm id (Setu stores perm when present), which is
+    globally unique and stable across sessions; match it against
+    perm_id first, then fall back to the session order id."""
+    target = int(to_float(row.get("target_order_id")) or 0)
+    if target <= 0:
+        return None
+    for o in open_orders or []:
+        if int(o.get("perm_id") or 0) == target:
+            return o
+    for o in open_orders or []:
+        if int(o.get("order_id") or 0) == target:
+            return o
+    return None
+
+
+def gate_cancel_target(row: dict, open_orders: list[dict]) -> tuple[str, dict]:
+    """C1: the target must still be a working order. Absence is NOT
+    a failure: the cancel's goal is already met (the order was
+    cancelled, filled or expired elsewhere), so the outcome is
+    "already_gone" — a terminal no-op Kubera files under Closed,
+    never a refusal, and it never touches the confidence streak."""
+    target_raw = str(row.get("target_order_id") or "")
+    if int(to_float(target_raw) or 0) <= 0:
+        return "refuse", {"gate": "target",
+                          "reason": "cancel row carries no usable "
+                                    "target_order_id"}
+    order = find_target_order(row, open_orders)
+    if order is None:
+        return "already_gone", {"gate": "target",
+                                "reason": f"order {target_raw} is not in "
+                                          f"live open orders (cancelled, "
+                                          f"filled or expired elsewhere)"}
+    return "found", {"order": order}
+
+
+def gate_cancel_identity(row: dict, order: dict) -> tuple[bool, dict]:
+    """C2: the live order must BE the contract the row names. con_id
+    is the anchor (it encodes symbol/expiry/strike/right); the
+    target action copied at raise time must also match."""
+    if int(order.get("con_id") or 0) != int(row["con_id"]):
+        return False, {"gate": "identity",
+                       "reason": f"live order con_id {order.get('con_id')} "
+                                 f"!= row con_id {row['con_id']}; refusing "
+                                 f"to cancel a different contract"}
+    want = str(row.get("target_action") or "").upper()
+    if want and str(order.get("action") or "").upper() != want:
+        return False, {"gate": "identity",
+                       "reason": f"live order action {order.get('action')} "
+                                 f"!= staged target action {want}"}
+    return True, {}
+
+
+def gate_cancel_unfilled(order: dict) -> tuple[bool, dict]:
+    """C3: the order must be verified completely unfilled. A partial
+    fill changes what cancelling means (the filled part is a done
+    trade), so it is a human decision; an unverifiable fill count
+    refuses for the same reason the reads gate does."""
+    filled = to_float(order.get("filled"))
+    if filled is None:
+        return False, {"gate": "unfilled",
+                       "reason": "cannot verify the target order is "
+                                 "unfilled (no orderStatus fill count); "
+                                 "refusing"}
+    if filled > 0:
+        return False, {"gate": "unfilled",
+                       "reason": f"target order already filled {filled:g}; "
+                                 f"a partial fill is a human decision"}
+    return True, {}
+
+
+def gate_cancel_premise(row: dict, positions: dict | None) -> tuple[bool, dict]:
+    """C4: scanner-raised rows carry the orphan premise — no live
+    position behind the order. Re-checked at execute time: if a
+    position has appeared for the contract since the raise, the
+    premise the approval rested on has changed, so refuse and hand
+    it back. Manual rows skip this gate: the human is the premise."""
+    if str(row.get("source") or "") != "orphan_scan":
+        return True, {}
+    pos = (positions or {}).get(int(row["con_id"]))
+    qty = to_float((pos or {}).get("quantity")) or 0.0
+    if pos is not None and qty != 0.0:
+        return False, {"gate": "premise",
+                       "reason": f"a live position for con_id "
+                                 f"{row['con_id']} now exists (qty {qty:g}); "
+                                 f"the orphan premise no longer holds"}
+    return True, {}
+
+
+def gate_cancel_not_own(row: dict, order: dict,
+                        own_refs: set) -> tuple[bool, dict]:
+    """C5: never cancel one of this program's own placed orders via
+    a scanner row — those are reconciled by orderRef and managed by
+    the placement flow. A manual row (a human's explicit decision)
+    may, and the placement reconciliation will then report the
+    cancellation normally."""
+    ref = str(order.get("order_ref") or "")
+    if ref and ref in own_refs and str(row.get("source") or "") != "manual":
+        return False, {"gate": "own_order",
+                       "reason": f"target carries orderRef {ref}, a "
+                                 f"setu-exec placed order; scanner rows "
+                                 f"never cancel the program's own orders"}
+    return True, {}
+
+
+def evaluate_cancel_gates(row: dict, positions: dict | None,
+                          open_orders: list[dict],
+                          own_refs: set) -> tuple[str, dict]:
+    """C1 -> C2 -> C3 -> C4 -> C5. Outcomes: "ok" (detail carries
+    the matched live order), "refuse" (gate + reason), "already_gone"
+    (terminal no-op, detail carries gate + reason)."""
+    outcome, detail = gate_cancel_target(row, open_orders)
+    if outcome != "found":
+        return outcome, detail
+    order = detail["order"]
+    for gate in (lambda: gate_cancel_identity(row, order),
+                 lambda: gate_cancel_unfilled(order),
+                 lambda: gate_cancel_premise(row, positions),
+                 lambda: gate_cancel_not_own(row, order, own_refs)):
+        ok, d = gate()
+        if not ok:
+            return "refuse", d
+    return "ok", {"order": order}
+
+
+def cancel_line(row: dict) -> str:
+    pc = "P" if str(row.get("option_type")) == "Put" else "C"
+    strike = row.get("strike")
+    strike_s = f"{strike:g}" if isinstance(strike, (int, float)) else str(strike)
+    act = str(row.get("target_action") or "?")
+    qty = row.get("target_quantity")
+    qty_s = f"{qty:g}" if isinstance(qty, (int, float)) else "?"
+    lim = row.get("target_limit_price")
+    lim_s = f"{lim:.2f}" if isinstance(lim, (int, float)) else "?"
+    return (f"{row.get('symbol')} {row.get('expiry')} {strike_s}{pc} "
+            f"{act} {qty_s} @ {lim_s} — order {row.get('target_order_id')} "
+            f"(row {row.get('id')})")
+
+
+# ---------------------------------------------------------------------------
 # Arm / live-enable files (siblings of the main config file)
 # ---------------------------------------------------------------------------
 
@@ -535,6 +716,8 @@ class PlacedTracker:
     def __init__(self, cfg: dict):
         self.path = state_path(cfg)
         self.orders: dict[str, dict] = {}
+        self.cancels: dict[str, dict] = {}   # v0.3: staged cancel rows
+        self.cancel_streak: int = 0          # v0.3: clean cancel runs
         self.transmissions: list[str] = []  # ISO times of live transmits
         self.load()
 
@@ -543,17 +726,27 @@ class PlacedTracker:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(data, dict) and isinstance(data.get("placed"), dict):
                 self.orders = data["placed"]
+            if isinstance(data, dict) and isinstance(data.get("cancels"), dict):
+                self.cancels = data["cancels"]
+            if isinstance(data, dict):
+                streak = data.get("cancel_streak")
+                if isinstance(streak, int) and streak >= 0:
+                    self.cancel_streak = streak
             brake = data.get("brake") if isinstance(data, dict) else None
             if isinstance(brake, dict) and isinstance(brake.get("transmissions"), list):
                 self.transmissions = [str(t) for t in brake["transmissions"]]
         except (OSError, ValueError):
             self.orders = {}
+            self.cancels = {}
+            self.cancel_streak = 0
             self.transmissions = []
 
     def save(self) -> None:
         try:
             self.path.write_text(
                 json.dumps({"placed": self.orders,
+                            "cancels": self.cancels,
+                            "cancel_streak": self.cancel_streak,
                             "brake": {"transmissions": self.transmissions}},
                            indent=2), encoding="utf-8")
         except OSError as exc:
@@ -638,6 +831,26 @@ class PlacedTracker:
     def get(self, row_id: str) -> dict | None:
         return self.orders.get(str(row_id))
 
+    # -- cancel tracking (v0.3) -----------------------------------------
+    def add_cancel(self, row_id: str, record: dict) -> None:
+        self.cancels[str(row_id)] = record
+        self.save()
+
+    def get_cancel(self, row_id: str) -> dict | None:
+        return self.cancels.get(str(row_id))
+
+    def drop_cancel(self, row_id: str) -> None:
+        if self.cancels.pop(str(row_id), None) is not None:
+            self.save()
+
+    def note_cancel_result(self, clean: bool) -> None:
+        """The Phase-2 confidence counter: a verified live cancel
+        extends the streak; a transmit or verification failure
+        resets it. Gate refusals and already_gone outcomes never
+        reach this — they are not executions."""
+        self.cancel_streak = self.cancel_streak + 1 if clean else 0
+        self.save()
+
 
 # ---------------------------------------------------------------------------
 # Kubera staged-orders client (contract: kubera-staged-orders-brief.md)
@@ -720,6 +933,20 @@ def normalise_row(raw: dict) -> dict:
         "quantity": to_float(raw.get("quantity")) or 0.0,
         "premium": to_float(raw.get("premium")),
         "target_limit": to_float(raw.get("target_limit")),
+        # v0.3: staged action. Absent (every pre-v0.3 row) = "place".
+        # A "cancel" row names ONE working order: target_order_id is
+        # the broker-orders feed's order id, which Setu stores as the
+        # order's perm id (globally unique), plus the target's own
+        # action/quantity/limit copied from the feed at raise time
+        # for the identity check and the human-readable line.
+        "action": str(raw.get("action") or "place").strip().lower(),
+        "target_order_id": str(raw.get("target_order_id") or ""),
+        "target_action": str(raw.get("target_action") or ""),
+        "target_quantity": to_float(raw.get("target_quantity")),
+        "target_limit_price": to_float(raw.get("target_limit_price")),
+        "reason": str(raw.get("reason") or ""),
+        "source": str(raw.get("source") or ""),
+        "approval_mode": str(raw.get("approval_mode") or ""),
     }
 
 
@@ -791,6 +1018,7 @@ class ExecGateway:
         self.positions_event = threading.Event()
         self.open_orders: list[dict] = []
         self.status_by_key: dict = {}
+        self.fill_by_key: dict = {}  # key -> (filled, remaining), v0.3
         self.last_status_by_perm: dict[int, str] = {}
         self.open_orders_event = threading.Event()
         self.next_id = 0
@@ -840,6 +1068,7 @@ class ExecGateway:
                     "order_ref": str(getattr(order, "orderRef", "") or ""),
                     "status": str(getattr(orderState, "status", "") or ""),
                     "perm_id": perm,
+                    "order_id": int(orderId),
                     "_key": key,
                 })
                 slot = outer.pending.get(int(orderId))
@@ -858,6 +1087,7 @@ class ExecGateway:
                             whyHeld="", mktCapPrice=0.0):
                 key = ("p", int(permId)) if permId else ("i", int(orderId))
                 outer.status_by_key[key] = str(status or "")
+                outer.fill_by_key[key] = (to_float(filled), to_float(remaining))
                 slot = outer.pending.get(int(orderId))
                 if slot is not None:
                     slot["status"] = str(status or "")
@@ -952,6 +1182,7 @@ class ExecGateway:
     def fetch_open_orders(self, timeout: float = 20.0) -> list[dict] | None:
         self.open_orders = []
         self.status_by_key = {}
+        self.fill_by_key = {}
         self.read_error = None
         self._reading = True
         self.open_orders_event.clear()
@@ -967,9 +1198,13 @@ class ExecGateway:
             int(k[1]): v for k, v in self.status_by_key.items() if k[0] == "p"}
         out = []
         for o in self.open_orders:
-            status = self.status_by_key.get(o.pop("_key"), None)
+            key = o.pop("_key")
+            status = self.status_by_key.get(key, None)
             if status:
                 o["status"] = status
+            filled, remaining = self.fill_by_key.get(key, (None, None))
+            o["filled"] = filled
+            o["remaining"] = remaining
             out.append(o)
         return out
 
@@ -1057,6 +1292,41 @@ class ExecGateway:
         return {"order_id": order_id, "perm_id": slot["perm_id"],
                 "status": slot["status"], "error": slot["error"]}
 
+    def cancel_order(self, order: dict) -> dict:
+        """Live cancel of an EXISTING order (v0.3) — the only cancel
+        call in this program. The target is addressed by the session
+        order id captured in the open-orders read. Awaiting the
+        orderStatus callback: Cancelled/ApiCancelled is success;
+        an IB error (e.g. 10147, order not cancellable by this
+        client) is returned verbatim for the caller to surface.
+        Whether the Gateway lets client 91 cancel another client's
+        order depends on the Master API Client ID setting; that is
+        a setup fact the first live rehearsal proves, and a refusal
+        here is data, not a crash."""
+        order_id = int(order.get("order_id") or 0)
+        if order_id <= 0:
+            return {"ok": False,
+                    "error": "target order carries no session order id"}
+        self.pending[order_id] = {"event": threading.Event(),
+                                  "order_state": None, "status": "",
+                                  "perm_id": int(order.get("perm_id") or 0),
+                                  "error": None}
+        try:
+            try:
+                self.client.cancelOrder(order_id, "")
+            except TypeError:
+                self.client.cancelOrder(order_id)
+            slot = self._await_slot(order_id, timeout=12.0)
+        finally:
+            self.pending.pop(order_id, None)
+        if slot["error"]:
+            return {"ok": False, "error": slot["error"]}
+        if slot["status"] in ("Cancelled", "ApiCancelled"):
+            return {"ok": True, "status": slot["status"]}
+        return {"ok": False,
+                "error": f"no cancellation confirmation from the Gateway "
+                         f"(last status: {slot['status'] or 'none'})"}
+
     def _next_order_id(self) -> int:
         oid = self.next_id
         self.next_id += 1
@@ -1140,6 +1410,7 @@ class Executor:
             return
 
         self.reconcile(open_orders)
+        self.reconcile_cancels(open_orders)
 
         try:
             rows = self.kubera.poll_approved()
@@ -1147,6 +1418,11 @@ class Executor:
             log(f"approved-orders poll failed ({exc}); idling")
             return
         for row in rows:
+            if row.get("action") == "cancel":
+                if self.tracker.get_cancel(row["id"]) is not None:
+                    continue  # cancel already transmitted; reconciling
+                self.process_cancel_row(row, positions, open_orders)
+                continue
             if self.tracker.get(row["id"]) is not None:
                 continue  # already placed once; never again
             self.process_row(row, positions, open_orders)
@@ -1208,6 +1484,40 @@ class Executor:
         except KuberaError as exc:
             log(f"event post failed for row {row_id} ({kind}): {exc}")
 
+    # -- cancel tracking (v0.3) ------------------------------------------
+    def reconcile_cancels(self, open_orders: list[dict]) -> None:
+        """Tracked cancels are resolved against live open orders,
+        mirroring reconcile(): a target that is still working means
+        the cancel has not landed (leave the record; process will
+        not re-transmit a tracked row). A target that is gone after
+        a transmission is the executed outcome even when this
+        process never saw the callback (restart case). A target
+        that vanished WITHOUT a transmission is already_gone."""
+        if not self.tracker.cancels:
+            return
+        for row_id, rec in list(self.tracker.cancels.items()):
+            probe = {"target_order_id": rec.get("target_order_id")}
+            if find_target_order(probe, open_orders) is not None:
+                # Still working: the cancel has not landed. The
+                # record stays and the row is never re-transmitted
+                # blindly; a human resolves it (the unverified
+                # Pushover at transmit time is the surface).
+                continue
+            if rec.get("transmitted"):
+                self._report(row_id, "executed", {
+                    "target_order_id": rec.get("target_order_id"),
+                    "perm_id": rec.get("perm_id"),
+                    "recovered": True,
+                    "cancel_streak": self.tracker.cancel_streak + 1})
+                self.tracker.note_cancel_result(True)
+                log(f"CANCEL EXECUTED (recovered) row {row_id} — target "
+                    f"{rec.get('target_order_id')} absent from live orders")
+            else:
+                self._report(row_id, "already_gone", {
+                    "target_order_id": rec.get("target_order_id"),
+                    "reason": "target vanished before any transmission"})
+            self.tracker.drop_cancel(row_id)
+
     # -- live-mode notification (v0.2; simulate never notifies) -----------
     def _notify(self, title: str, message: str) -> None:
         if self.mode != "live":
@@ -1245,6 +1555,133 @@ class Executor:
             f" — {detail.get('reason')}")
         self._report(row["id"], "gate_failed", detail)
         self._notify_refusal(row, detail)
+
+    def _report_cancel_gate_failure(self, row: dict, detail: dict,
+                                    line: str) -> None:
+        """Cancel-gate verdicts, mode-appropriate exactly like
+        placement (v0.2.1 semantics): simulate failures are NOT
+        terminal (posted as would_execute with a simulate_gate_failed
+        detail, returning the row to APPROVED), live failures are
+        gate_failed plus the refusal Pushover."""
+        if self.mode == "simulate":
+            log(f"SIMULATE CANCEL GATE FAILED [{detail.get('gate')}] {line}"
+                f" — {detail.get('reason')}")
+            self._report(row["id"], "would_execute", {
+                "simulate_gate_failed": True,
+                "gate": detail.get("gate"),
+                "reason": detail.get("reason")})
+            return
+        log(f"CANCEL GATE FAILED [{detail.get('gate')}] {line}"
+            f" — {detail.get('reason')}")
+        self._report(row["id"], "gate_failed", detail)
+        self._notify("setu-exec: cancel refused",
+                     f"{self.account} cancel {line} — refused at gate "
+                     f"[{detail.get('gate')}]: {detail.get('reason')}")
+
+    # -- one staged cancel row (v0.3) --------------------------------------
+    def process_cancel_row(self, row: dict, positions: dict[int, dict] | None,
+                           open_orders: list[dict] | None) -> None:
+        line = cancel_line(row)
+        self._report(row["id"], "executing", {"mode": self.mode})
+        if positions is None or open_orders is None:
+            detail = {"gate": "reads_incomplete",
+                      "reason": "live Gateway reads did not complete; "
+                                "refusing to evaluate gates on partial data"}
+            self._report_cancel_gate_failure(row, detail, line)
+            return
+        own_refs = set(self.tracker.orders.keys())
+        outcome, detail = evaluate_cancel_gates(row, positions, open_orders,
+                                                own_refs)
+        if outcome == "already_gone":
+            log(f"CANCEL NOT NEEDED {line} — {detail.get('reason')}")
+            self._report(row["id"], "already_gone", detail)
+            return
+        if outcome != "ok":
+            self._report_cancel_gate_failure(row, detail, line)
+            return
+        order = detail["order"]
+
+        if self.mode == "simulate":
+            log(f"WOULD CANCEL {line}")
+            self._report(row["id"], "would_execute", {
+                "target_order_id": row["target_order_id"],
+                "perm_id": order.get("perm_id"),
+                "approval_mode": row.get("approval_mode") or "manual"})
+            return
+
+        # Live: shared runaway brake, deferring exactly like a
+        # placement (the row returns to APPROVED via would_execute).
+        brake_ok, brake_reason = self.tracker.brake_check()
+        if not brake_ok:
+            wait = self.tracker.brake_wait_seconds()
+            if wait is not None:
+                log(f"RUNAWAY BRAKE [defer] cancel {line} — {brake_reason}; "
+                    f"retry in ~{wait:.0f}s, row left APPROVED")
+            else:
+                log(f"RUNAWAY BRAKE [defer] cancel {line} — {brake_reason}; "
+                    f"row left APPROVED until the daily count resets")
+            self._report(row["id"], "would_execute", {
+                "deferred": True, "gate": "runaway_brake",
+                "reason": brake_reason})
+            return
+
+        # Record BEFORE transmitting so a crash mid-cancel leaves a
+        # trace reconcile_cancels() can resolve next cycle.
+        self.tracker.add_cancel(row["id"], {
+            "target_order_id": row["target_order_id"],
+            "perm_id": order.get("perm_id"),
+            "con_id": row["con_id"],
+            "transmitted": False,
+            "staged_at": datetime.now(LONDON).isoformat(timespec="seconds")})
+        self.tracker.record_transmission()
+        self.tracker.cancels[str(row["id"])]["transmitted"] = True
+        self.tracker.save()
+        try:
+            result = self.gateway.cancel_order(order)
+        except Exception as exc:
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        if not result.get("ok"):
+            log(f"CANCEL FAILED {line} — {result.get('error')}")
+            self._report(row["id"], "failed",
+                         {"reason": result.get("error"),
+                          "target_order_id": row["target_order_id"]})
+            self._notify("setu-exec: cancel FAILED",
+                         f"{self.account} cancel {line} — "
+                         f"{result.get('error')}")
+            self.tracker.note_cancel_result(False)
+            self.tracker.drop_cancel(row["id"])
+            return
+
+        # The callback said cancelled; trust, but verify on a FRESH
+        # read — the broker feed, not the claim, is the truth this
+        # program reports.
+        fresh = self.gateway.fetch_open_orders()
+        if fresh is not None and find_target_order(row, fresh) is None:
+            self._report(row["id"], "executed", {
+                "target_order_id": row["target_order_id"],
+                "perm_id": order.get("perm_id"),
+                "verified_absent": True,
+                "approval_mode": row.get("approval_mode") or "manual",
+                "cancel_streak": self.tracker.cancel_streak + 1})
+            self.tracker.note_cancel_result(True)
+            self.tracker.drop_cancel(row["id"])
+            log(f"CANCELLED {line} — verified absent on a fresh read")
+            self._notify("setu-exec: order cancelled",
+                         f"{self.account} cancel {line} — CANCELLED and "
+                         f"verified absent from live orders")
+            return
+        # Callback success but the order still shows (or the verify
+        # read failed): do NOT claim success and never retry blindly.
+        # The record stays tracked; reconcile_cancels() resolves it
+        # against the next cycle's reads.
+        log(f"CANCEL UNVERIFIED {line} — Gateway reported "
+            f"{result.get('status')}, but the target still appears (or "
+            f"the verification read failed); leaving tracked for "
+            f"reconciliation")
+        self._notify("setu-exec: cancel unverified",
+                     f"{self.account} cancel {line} — Gateway reported "
+                     f"cancelled but the order still appears; NOT "
+                     f"confirmed, tracked for reconciliation")
 
     # -- one staged row -------------------------------------------------------
     def process_row(self, row: dict, positions: dict[int, dict] | None,
@@ -1387,7 +1824,8 @@ class Executor:
             kill = self._last_kill if self._last_kill is not None else "unknown"
             log(f"posture: mode={self.mode} armed={is_armed(self.cfg)} "
                 f"kill_switch={kill} "
-                f"placements_today={self.tracker.placements_today()}")
+                f"placements_today={self.tracker.placements_today()} "
+                f"cancel_streak={self.tracker.cancel_streak}")
             time.sleep(poll)
 
     def run_once(self) -> int:
