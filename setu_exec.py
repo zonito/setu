@@ -60,6 +60,34 @@ account):
     transient what-if timeout refused a row before live ever
     saw it. Live gate_failed behaviour is unchanged.
 
+v0.3.2 (2026-10-25): cancel reach for manually placed orders, and
+  honest brake accounting.
+  * The Gateway reports automatic (manually placed) orders to an
+    API session with orderId 0 — visible, but with no handle a
+    cancel can address. Three live cancel attempts on 2026-10-25
+    failed pre-transmit on exactly that. Binding is the fix, with
+    two quirks proven live the same day: reqAutoOpenOrders is
+    accepted ONLY from client id 0 (error 321 for any other), and
+    binding is sticky account state — once asserted, the orders
+    keep their ids in every client's reads. So on every connect
+    the executor asserts binding through a throwaway client-0
+    side-connection; its own reads are then the BOUND view and
+    manual orders carry session order ids (negative on Gateways
+    with "Use negative numbers to bind automatic orders" set). A
+    non-zero id, negative included, is a valid cancel handle; the
+    placement duplicate gate reads the same bound snapshot — there
+    is still exactly one open-orders read path.
+  * The runaway brake counts only actual transmissions. The
+    cancel path recorded a transmission before calling the
+    Gateway, and the no-session-id refusal inside cancel_order()
+    never transmitted — three failed attempts consumed three
+    daily slots with zero API calls. The no-id case is now
+    resolved before the brake record (same `failed` surface,
+    streak still reset); gate failures and incomplete reads
+    already returned before the record and still do. Placement
+    accounting was verified unchanged: its record sits
+    immediately before a transmit() that always calls placeOrder.
+
 v0.3.1 (2026-10-25): Kubera-raised cancel rows carry con_id 0 (the
   broker-orders feed has no con_id). Identity (C2) is then verified
   descriptively against the live order's own contract fields
@@ -134,7 +162,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -504,8 +532,10 @@ def order_line(row: dict, qty: float, limit: float) -> str:
 # source ("orphan_scan" | "manual" | ...) and approval_mode
 # ("manual" | "bypass").
 # A live open order additionally carries (v0.3) "order_id" (the
-# session order id in the placing client's space) and
-# "filled"/"remaining" merged from the orderStatus callbacks.
+# session order id in THIS client's bound view — automatic orders
+# are bound on connect since v0.3.2, and their ids may be
+# negative) and "filled"/"remaining" merged from the orderStatus
+# callbacks.
 # ---------------------------------------------------------------------------
 
 def find_target_order(row: dict, open_orders: list[dict]) -> dict | None:
@@ -1173,7 +1203,105 @@ class ExecGateway:
             return False
         self.thread = threading.Thread(target=self.client.run, daemon=True)
         self.thread.start()
-        return self.connected_event.wait(timeout=15)
+        if not self.connected_event.wait(timeout=15):
+            return False
+        self.ensure_binding()
+        return True
+
+    def _make_binding_client(self, wrapper):
+        from ibapi.client import EClient
+        return EClient(wrapper)
+
+    def ensure_binding(self) -> None:
+        """Make sure the account's automatic (manually placed)
+        orders are BOUND, so they carry session order ids in the
+        reads (v0.3.2). The facts, all proven live on 2026-10-25:
+
+        * Unbound manual orders arrive with orderId 0 — visible,
+          but a cancel has no handle to address.
+        * reqAutoOpenOrders is accepted ONLY from client id 0
+          ("Only the default client (i.e 0) can auto bind orders",
+          IB error 321 for any other client) — so this executor,
+          client 91 by design, cannot bind on its own connection,
+          and the attempt's error must never reach the main
+          connection, where it would poison the first read.
+        * Binding is STICKY account state: once any client-0
+          session asserts it, the orders keep their (negative)
+          ids in every client's reads, even after that session
+          disconnects.
+
+        So binding is asserted through a throwaway client-0
+        side-connection on every (re)connect of the main one: its
+        errors live and die inside the side session, and the main
+        connection's read machinery is untouched. If client 0 is
+        unavailable or nothing binds, the executor proceeds
+        unbound — placements are unaffected, and a cancel whose
+        target stays at id 0 fails with its precise reason."""
+        from ibapi.wrapper import EWrapper
+
+        outer = self
+
+        class BindWrapper(EWrapper):
+            def __init__(self):
+                self.ready = threading.Event()
+                self.bound_seen = threading.Event()
+
+            def nextValidId(self, orderId):
+                self.ready.set()
+
+            def openOrder(self, orderId, contract, order, orderState):
+                if int(orderId) < 0:
+                    self.bound_seen.set()
+
+            def error(self, reqId, errorCode, errorString,
+                      advancedOrderRejectJson=""):
+                pass  # side-session errors are never read poison
+
+        wrapper = BindWrapper()
+        try:
+            client = self._make_binding_client(wrapper)
+            client.connect(self.cfg["gateway_host"],
+                           int(self.cfg["gateway_port"]), 0)
+        except Exception as exc:
+            log(f"binding side-connection failed ({type(exc).__name__}: "
+                f"{exc}); manual orders may stay unbound")
+            return
+        thread = threading.Thread(target=client.run, daemon=True)
+        thread.start()
+        try:
+            if not wrapper.ready.wait(timeout=10):
+                log("binding side-connection never became ready; "
+                    "manual orders may stay unbound")
+                return
+            client.reqAutoOpenOrders(True)
+            # Wait until the bound view is actually visible
+            # (negative ids in a read) rather than trusting the
+            # call: propagation took seconds in live probing. An
+            # account with no manual orders never shows one; that
+            # is not an error.
+            deadline = time.monotonic() + 10.0
+            while (not wrapper.bound_seen.is_set()
+                   and time.monotonic() < deadline):
+                try:
+                    client.reqAllOpenOrders()
+                except Exception:
+                    break
+                wrapper.bound_seen.wait(timeout=2.0)
+            if wrapper.bound_seen.is_set():
+                log("automatic orders bound via client 0 "
+                    "side-connection; manual orders carry session ids")
+            else:
+                log("binding asserted via client 0; no bound order "
+                    "observed within 10s (account may have no "
+                    "manual orders)")
+        except Exception as exc:
+            log(f"binding assertion failed ({type(exc).__name__}: "
+                f"{exc}); manual orders may stay unbound")
+        finally:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
 
     def disconnect(self):
         try:
@@ -1347,7 +1475,11 @@ class ExecGateway:
         a setup fact the first live rehearsal proves, and a refusal
         here is data, not a crash."""
         order_id = int(order.get("order_id") or 0)
-        if order_id <= 0:
+        # Any non-zero id is a valid handle — bound automatic
+        # orders carry NEGATIVE session ids on Gateways with "Use
+        # negative numbers to bind automatic orders" set (v0.3.2).
+        # Zero means the order never bound to this session.
+        if order_id == 0:
             return {"ok": False,
                     "error": "target order carries no session order id"}
         self.pending[order_id] = {"event": threading.Event(),
@@ -1621,6 +1753,22 @@ class Executor:
                      f"{self.account} cancel {line} — refused at gate "
                      f"[{detail.get('gate')}]: {detail.get('reason')}")
 
+    def _cancel_failed(self, row: dict, line: str, error) -> None:
+        """A cancel execution failure (v0.3): log it, file the
+        terminal `failed` event with the reason verbatim, Pushover,
+        reset the confidence streak, drop the tracking record. Used
+        after a transmitted cancel the Gateway refused, and — since
+        v0.3.2 — for the pre-transmit no-session-id case, which
+        never reaches the Gateway at all."""
+        log(f"CANCEL FAILED {line} — {error}")
+        self._report(row["id"], "failed",
+                     {"reason": error,
+                      "target_order_id": row["target_order_id"]})
+        self._notify("setu-exec: cancel FAILED",
+                     f"{self.account} cancel {line} — {error}")
+        self.tracker.note_cancel_result(False)
+        self.tracker.drop_cancel(row["id"])
+
     # -- one staged cancel row (v0.3) --------------------------------------
     def process_cancel_row(self, row: dict, positions: dict[int, dict] | None,
                            open_orders: list[dict] | None) -> None:
@@ -1645,10 +1793,22 @@ class Executor:
         order = detail["order"]
 
         if self.mode == "simulate":
+            if int(order.get("order_id") or 0) == 0:
+                # The target never bound to a session order id, so
+                # a live cancel could not even be addressed
+                # (v0.3.2). Simulate surfaces that as a (never
+                # terminal) gate verdict rather than a WOULD CANCEL
+                # claim live would fail to keep.
+                self._report_cancel_gate_failure(row, {
+                    "gate": "target",
+                    "reason": "target order carries no session order id"},
+                    line)
+                return
             log(f"WOULD CANCEL {line}")
             self._report(row["id"], "would_execute", {
                 "target_order_id": row["target_order_id"],
                 "perm_id": order.get("perm_id"),
+                "order_id": order.get("order_id"),
                 "approval_mode": row.get("approval_mode") or "manual"})
             return
 
@@ -1668,6 +1828,19 @@ class Executor:
                 "reason": brake_reason})
             return
 
+        if int(order.get("order_id") or 0) == 0:
+            # No session order id even in the bound view (v0.3.2):
+            # the cancel cannot be addressed, so nothing is
+            # transmitted — and the runaway brake must not count an
+            # attempt that never reached the Gateway. (v0.3.0
+            # recorded the transmission first and let cancel_order()
+            # refuse, so three such failures on 2026-10-25 consumed
+            # three daily slots with zero API calls.) Same failure
+            # surface as a Gateway refusal, minus the transmission.
+            self._cancel_failed(row, line,
+                                "target order carries no session order id")
+            return
+
         # Record BEFORE transmitting so a crash mid-cancel leaves a
         # trace reconcile_cancels() can resolve next cycle.
         self.tracker.add_cancel(row["id"], {
@@ -1684,15 +1857,7 @@ class Executor:
         except Exception as exc:
             result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         if not result.get("ok"):
-            log(f"CANCEL FAILED {line} — {result.get('error')}")
-            self._report(row["id"], "failed",
-                         {"reason": result.get("error"),
-                          "target_order_id": row["target_order_id"]})
-            self._notify("setu-exec: cancel FAILED",
-                         f"{self.account} cancel {line} — "
-                         f"{result.get('error')}")
-            self.tracker.note_cancel_result(False)
-            self.tracker.drop_cancel(row["id"])
+            self._cancel_failed(row, line, result.get("error"))
             return
 
         # The callback said cancelled; trust, but verify on a FRESH

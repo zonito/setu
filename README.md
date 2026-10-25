@@ -154,12 +154,25 @@ read that the target is actually gone before reporting `executed`.
 Every cancel, approved or (later) bypassed, lives as a staged row
 and files into Kubera's Closed ledger — no row, no execution, ever.
 
-**One extra Gateway setup step for cancels:** cancelling an order
-placed by another client requires this executor's client id (91) to
-be the account's **Master API Client ID** (Gateway → Configure →
-Settings → API → Settings). Without it the Gateway refuses with
-error 10147, which the executor surfaces verbatim as the row's
-failure reason. The first live cancel is the proof of the setting.
+**Gateway setup for cancels:** two facts make a cancel reachable.
+First, binding (code-side, v0.3.2): unbound, the Gateway reports
+manually placed orders with order id 0 — visible, but with no
+session handle a cancel can address. `reqAutoOpenOrders` binds
+them, but the Gateway accepts that call ONLY from client id 0
+(error 321 for any other client), and binding is sticky account
+state once asserted. So on every connect the executor asserts
+binding through a throwaway client-0 side-connection, then reads
+the bound view on its own connection. Bound orders carry real
+session ids; with the Gateway setting **"Use negative numbers to
+bind automatic orders"** (Gateway → Configure → Settings → API →
+Settings) those ids are negative, which the executor accepts as
+valid cancel handles. That setting is recommended, so bound ids
+can never collide with the session's own id sequence. Second,
+the Master API Client ID: cancelling an order placed by another
+*API client* requires this executor's client id (91) to be the
+account's **Master API Client ID** (same settings page). Without
+it the Gateway refuses with error 10147, which the executor
+surfaces verbatim as the row's failure reason.
 
 **Phase 2 (after confidence):** when the `cancel_streak` counter in
 `executor-state.json` — reported in every `executed` event — reaches

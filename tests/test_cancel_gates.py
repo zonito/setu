@@ -335,5 +335,185 @@ class CancelFlowTests(unittest.TestCase):
             self.assertEqual(ex.tracker.cancel_streak, 0)
 
 
+class BoundOrderFlowTests(unittest.TestCase):
+    """v0.3.2: bound automatic orders carry session order ids
+    (negative on Gateways with the negative-binding setting), and
+    the runaway brake counts only actual transmissions."""
+
+    def test_simulate_bound_negative_id_would_execute_carries_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            order = live_order(order_id=-4242)
+            ex, kub, gw = make_executor(
+                tmp, gateway=FakeGateway(orders=[order]))
+            ex.process_cancel_row(dict(CANCEL_ROW), {}, gw.fetch_open_orders())
+            self.assertIn("would_execute", kub.kinds())
+            self.assertNotIn("failed", kub.kinds())
+            detail = [d for _, k, d in kub.events if k == "would_execute"][0]
+            self.assertEqual(detail.get("order_id"), -4242)
+            self.assertEqual(detail.get("perm_id"), PERM)
+            self.assertEqual(gw.cancel_calls, [])
+
+    def test_live_bound_negative_id_transmits_and_counts_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            order = live_order(order_id=-4242)
+            gw = FakeGateway(orders=[order])
+            ex, kub, gw = make_executor(tmp, mode="live", gateway=gw)
+            ex.process_cancel_row(dict(CANCEL_ROW), {}, gw.fetch_open_orders())
+            self.assertEqual(len(gw.cancel_calls), 1)
+            self.assertEqual(gw.cancel_calls[0].get("order_id"), -4242)
+            self.assertIn("executed", kub.kinds())
+            self.assertEqual(ex.tracker.cancel_streak, 1)
+            # The one actual transmission is counted, and it starts
+            # the 60s spacing clock.
+            self.assertEqual(ex.tracker.placements_today(), 1)
+            ok, reason = ex.tracker.brake_check()
+            self.assertFalse(ok)
+            self.assertIn("transmission", reason)
+
+    def test_live_unbound_zero_id_fails_without_consuming_brake(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            order = live_order(order_id=0)
+            gw = FakeGateway(orders=[order])
+            ex, kub, gw = make_executor(tmp, mode="live", gateway=gw)
+            ex.tracker.cancel_streak = 2
+            ex.process_cancel_row(dict(CANCEL_ROW), {}, gw.fetch_open_orders())
+            self.assertIn("failed", kub.kinds())
+            detail = [d for _, k, d in kub.events if k == "failed"][0]
+            self.assertEqual(detail.get("reason"),
+                             "target order carries no session order id")
+            # Nothing was transmitted: the gateway was never called,
+            # no daily slot was consumed, no spacing clock started,
+            # and the streak still resets (it is an execution
+            # failure, like a Gateway refusal).
+            self.assertEqual(gw.cancel_calls, [])
+            self.assertEqual(ex.tracker.placements_today(), 0)
+            ok, _ = ex.tracker.brake_check()
+            self.assertTrue(ok)
+            self.assertEqual(ex.tracker.cancel_streak, 0)
+            self.assertIsNone(ex.tracker.get_cancel(CANCEL_ROW["id"]))
+
+    def test_simulate_unbound_zero_id_is_nonterminal_gate_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            order = live_order(order_id=0)
+            ex, kub, gw = make_executor(
+                tmp, gateway=FakeGateway(orders=[order]))
+            ex.process_cancel_row(dict(CANCEL_ROW), {}, gw.fetch_open_orders())
+            kinds = kub.kinds()
+            self.assertIn("would_execute", kinds)
+            self.assertNotIn("failed", kinds)
+            self.assertNotIn("gate_failed", kinds)
+            detail = [d for _, k, d in kub.events if k == "would_execute"][0]
+            self.assertTrue(detail.get("simulate_gate_failed"))
+            self.assertEqual(detail.get("gate"), "target")
+            self.assertEqual(gw.cancel_calls, [])
+
+
+class StubClient:
+    """Minimal EClient double for ExecGateway-level tests: records
+    binding and cancel calls, completes cancels synchronously."""
+
+    def __init__(self, wrapper):
+        self.wrapper = wrapper
+        self.auto_open_calls = []
+        self.cancel_calls = []
+
+    def connect(self, host, port, client_id):
+        self.wrapper.nextValidId(1000)
+
+    def run(self):
+        return None
+
+    def disconnect(self):
+        pass
+
+    def isConnected(self):
+        return True
+
+    def reqAutoOpenOrders(self, flag):
+        self.auto_open_calls.append(flag)
+
+    def cancelOrder(self, order_id, manual_order_cancel_time=""):
+        self.cancel_calls.append(order_id)
+        self.wrapper.orderStatus(order_id, "Cancelled", 0.0, 10.0, 0.0,
+                                 permId=PERM)
+
+
+class StubBindingClient:
+    """The client-0 side-connection double: records how it was
+    used and immediately shows a bound (negative-id) order."""
+
+    def __init__(self, wrapper):
+        self.wrapper = wrapper
+        self.connect_client_ids = []
+        self.auto_open_calls = []
+        self.disconnected = False
+
+    def connect(self, host, port, client_id):
+        self.connect_client_ids.append(client_id)
+        self.wrapper.nextValidId(1)
+
+    def run(self):
+        return None
+
+    def disconnect(self):
+        self.disconnected = True
+
+    def reqAutoOpenOrders(self, flag):
+        self.auto_open_calls.append(flag)
+        self.wrapper.openOrder(-5, None, None, None)
+
+    def reqAllOpenOrders(self):
+        pass
+
+
+class GatewayBindingTests(unittest.TestCase):
+    def _gateway(self, tmp):
+        cfg = make_cfg(tmp)
+        gw = setu_exec.ExecGateway(cfg)
+        stub = StubClient(gw.wrapper)
+        gw.client = stub
+        return gw, stub
+
+    def test_connect_asserts_binding_via_side_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, stub = self._gateway(tmp)
+            calls = []
+            gw.ensure_binding = lambda: calls.append(True)
+            self.assertTrue(gw.connect())
+            self.assertEqual(calls, [True])
+
+    def test_ensure_binding_uses_client_zero_and_disconnects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, stub = self._gateway(tmp)
+            holder = {}
+
+            def make_client(wrapper):
+                holder["client"] = StubBindingClient(wrapper)
+                return holder["client"]
+
+            gw._make_binding_client = make_client
+            gw.ensure_binding()
+            binding = holder["client"]
+            self.assertEqual(binding.connect_client_ids, [0])
+            self.assertEqual(binding.auto_open_calls, [True])
+            self.assertTrue(binding.disconnected)
+
+    def test_cancel_order_accepts_negative_bound_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, stub = self._gateway(tmp)
+            result = gw.cancel_order({"order_id": -5, "perm_id": PERM})
+            self.assertTrue(result.get("ok"))
+            self.assertEqual(stub.cancel_calls, [-5])
+
+    def test_cancel_order_zero_id_refused_without_a_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, stub = self._gateway(tmp)
+            result = gw.cancel_order({"order_id": 0, "perm_id": PERM})
+            self.assertFalse(result.get("ok"))
+            self.assertEqual(result.get("error"),
+                             "target order carries no session order id")
+            self.assertEqual(stub.cancel_calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
