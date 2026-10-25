@@ -655,12 +655,16 @@ class StubSideCancelClient:
     (perm id -> session id) and completes a cancel synchronously
     through the wrapper, the way the real Gateway does."""
 
-    def __init__(self, wrapper, view=None, cancel_error=None):
+    def __init__(self, wrapper, view=None, cancel_error=None,
+                 cancel_error_id=None):
         from types import SimpleNamespace
         self._ns = SimpleNamespace
         self.wrapper = wrapper
         self.view = {PERM: -5} if view is None else view
         self.cancel_error = cancel_error  # (code, message) or None
+        # When set, the error is delivered under this reqId instead
+        # of the cancelled order's own id (an UNTIED error, v0.3.4).
+        self.cancel_error_id = cancel_error_id
         self.connect_client_ids = []
         self.auto_open_calls = []
         self.cancel_calls = []
@@ -689,10 +693,49 @@ class StubSideCancelClient:
         self.cancel_calls.append(order_id)
         if self.cancel_error is not None:
             code, message = self.cancel_error
-            self.wrapper.error(order_id, code, message)
+            rid = (self.cancel_error_id if self.cancel_error_id is not None
+                   else order_id)
+            self.wrapper.error(rid, code, message)
             return
         self.wrapper.orderStatus(order_id, "Cancelled", 0.0, 10.0, 0.0,
                                  permId=PERM)
+
+
+class StubMain202Client:
+    """Main-client double answering a cancel the way the real
+    Gateway confirmed the 2026-10-25 live cancel: error 202
+    ("Order Canceled") through the error callback, reqId = the
+    cancelled order's session id (v0.3.4). With error_id set, the
+    202 is delivered under a DIFFERENT order's id — untied — and
+    the target merely reports a working status."""
+
+    def __init__(self, wrapper, error_id=None):
+        self.wrapper = wrapper
+        self.error_id = error_id
+        self.cancel_calls = []
+
+    def connect(self, host, port, client_id):
+        self.wrapper.nextValidId(1000)
+
+    def run(self):
+        return None
+
+    def disconnect(self):
+        pass
+
+    def isConnected(self):
+        return True
+
+    def cancelOrder(self, order_id, manual_order_cancel_time=""):
+        self.cancel_calls.append(order_id)
+        rid = self.error_id if self.error_id is not None else order_id
+        self.wrapper.error(rid, 202, "Order Canceled - reason:")
+        if rid != order_id:
+            # Nothing terminal for the target itself; give the
+            # gateway's await a working status so the method
+            # returns its no-confirmation verdict at once.
+            self.wrapper.orderStatus(order_id, "PreSubmitted", 0.0,
+                                     10.0, 0.0, permId=PERM)
 
 
 class GatewayBoundCancelTests(unittest.TestCase):
@@ -812,6 +855,214 @@ class GatewayBoundCancelTests(unittest.TestCase):
             self.assertTrue(result.get("ok"))
             self.assertEqual(stub.cancel_calls, [8811])
             self.assertEqual(fired, [True])
+
+
+class GatewayCancel202Tests(unittest.TestCase):
+    """v0.3.4: IB error 202 ("Order Canceled") is the Gateway's
+    cancellation CONFIRMATION, delivered through the error
+    callback. Tied to the target session order id it counts as
+    the cancel having landed, on BOTH routes; tied to any other
+    id it counts for nothing. (The 10147 refusal behaviour is
+    unchanged — see test_bound_cancel_gateway_error_surfaces_verbatim.)"""
+
+    def test_main_cancel_answered_by_202_is_a_cancellation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = setu_exec.ExecGateway(make_cfg(tmp))
+            stub = StubMain202Client(gw.wrapper)
+            gw.client = stub
+            fired = []
+            result = gw.cancel_order({"order_id": 8811, "perm_id": PERM},
+                                     on_transmit=lambda: fired.append(True))
+            self.assertTrue(result.get("ok"))
+            self.assertEqual(result.get("status"), "Cancelled")
+            self.assertEqual(stub.cancel_calls, [8811])
+            self.assertEqual(fired, [True])
+
+    def test_main_cancel_untied_202_is_not_a_cancellation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = setu_exec.ExecGateway(make_cfg(tmp))
+            stub = StubMain202Client(gw.wrapper, error_id=777)
+            gw.client = stub
+            result = gw.cancel_order({"order_id": 8811, "perm_id": PERM})
+            self.assertFalse(result.get("ok"))
+            self.assertIn("no cancellation confirmation",
+                          result.get("error", ""))
+            self.assertEqual(stub.cancel_calls, [8811])
+
+    def test_bound_cancel_answered_by_202_is_a_cancellation(self):
+        # The exact wire shape of the 2026-10-25 live event: the
+        # side session transmits, the Gateway answers error 202
+        # under the target's own (negative) session id.
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = setu_exec.ExecGateway(make_cfg(tmp))
+            gw.client = StubClient(gw.wrapper)
+            holder = {}
+
+            def make_client(wrapper):
+                holder["client"] = StubSideCancelClient(
+                    wrapper, cancel_error=(202, "Order Canceled - reason:"))
+                return holder["client"]
+
+            gw._make_binding_client = make_client
+            fired = []
+            result = gw.cancel_bound_order(
+                {"order_id": -5, "perm_id": PERM},
+                on_transmit=lambda: fired.append(True))
+            self.assertTrue(result.get("ok"))
+            self.assertTrue(result.get("transmitted"))
+            self.assertEqual(result.get("status"), "Cancelled")
+            self.assertEqual(holder["client"].cancel_calls, [-5])
+            self.assertTrue(holder["client"].disconnected)
+            self.assertEqual(fired, [True])
+
+    def test_bound_cancel_untied_202_is_not_a_cancellation(self):
+        # A 202 naming some OTHER order settles nothing for the
+        # target: the side wrapper never records it, no terminal
+        # callback arrives, and the gateway reports its ordinary
+        # no-confirmation failure. (This runs out the gateway's
+        # real 12s confirmation wait — that IS the behaviour when
+        # the Gateway never confirms.)
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = setu_exec.ExecGateway(make_cfg(tmp))
+            gw.client = StubClient(gw.wrapper)
+            holder = {}
+
+            def make_client(wrapper):
+                holder["client"] = StubSideCancelClient(
+                    wrapper, cancel_error=(202, "Order Canceled - reason:"),
+                    cancel_error_id=-999)
+                return holder["client"]
+
+            gw._make_binding_client = make_client
+            result = gw.cancel_bound_order({"order_id": -5, "perm_id": PERM})
+            self.assertFalse(result.get("ok"))
+            self.assertTrue(result.get("transmitted"))
+            self.assertIn("no cancellation confirmation",
+                          result.get("error", ""))
+            self.assertEqual(holder["client"].cancel_calls, [-5])
+
+
+class RealGatewayHybrid:
+    """Executor-facing gateway double whose cancel methods are the
+    REAL ExecGateway ones (wired to stub IB clients), while reads
+    come from a local list — so a test can run the wire-level
+    classification (error 202) through the whole executor flow,
+    verification read included. drop_on_cancel=False models a
+    cancel the Gateway confirmed but the next read still shows:
+    the executor's unverified case."""
+
+    def __init__(self, real_gw, orders, drop_on_cancel=True):
+        self.real = real_gw
+        self.orders = list(orders)
+        self.drop_on_cancel = drop_on_cancel
+
+    def fetch_positions(self):
+        return {}
+
+    def fetch_open_orders(self):
+        return list(self.orders)
+
+    def _apply(self, order, result):
+        if result.get("ok") and self.drop_on_cancel:
+            self.orders = [o for o in self.orders
+                           if o.get("perm_id") != order.get("perm_id")]
+
+    def cancel_order(self, order, on_transmit=None):
+        result = self.real.cancel_order(order, on_transmit=on_transmit)
+        self._apply(order, result)
+        return result
+
+    def cancel_bound_order(self, order, on_transmit=None):
+        result = self.real.cancel_bound_order(
+            order, on_transmit=on_transmit)
+        self._apply(order, result)
+        return result
+
+    def probe_bound_target(self, order):
+        return {"visible": True, "order_id": order.get("order_id"),
+                "error": None}
+
+
+class Cancel202FlowTests(unittest.TestCase):
+    """v0.3.4 end to end: a cancel answered by error 202 runs
+    through the executor's unchanged fresh-read verification —
+    target absent posts `executed` and increments the streak, on
+    both routes. Target still present is NOT an executed claim:
+    the existing unverified path (no executed event, no streak
+    increment, record left tracked for reconciliation)."""
+
+    def _live_executor(self, tmp, gateway):
+        cfg = make_cfg(tmp, mode="live", live_file=True)
+        kub = FakeKubera([])
+        tracker = setu_exec.PlacedTracker(cfg)
+        ex = setu_exec.Executor(cfg, kub, gateway, tracker)
+        return ex, kub
+
+    def _bound_real_gateway(self, tmp):
+        real = setu_exec.ExecGateway(make_cfg(tmp))
+        real.client = StubClient(real.wrapper)
+
+        def make_client(wrapper):
+            return StubSideCancelClient(
+                wrapper, cancel_error=(202, "Order Canceled - reason:"))
+
+        real._make_binding_client = make_client
+        return real
+
+    def test_live_main_cancel_202_executes_and_counts_streak(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = setu_exec.ExecGateway(make_cfg(tmp))
+            stub = StubMain202Client(real.wrapper)
+            real.client = stub
+            hybrid = RealGatewayHybrid(real, [live_order()])
+            ex, kub = self._live_executor(tmp, hybrid)
+            ex.process_cancel_row(dict(CANCEL_ROW), {},
+                                  hybrid.fetch_open_orders())
+            self.assertEqual(stub.cancel_calls, [8811])
+            self.assertIn("executed", kub.kinds())
+            self.assertNotIn("failed", kub.kinds())
+            ev = [d for _, k, d in kub.events if k == "executed"][0]
+            self.assertTrue(ev.get("verified_absent"))
+            self.assertEqual(ev.get("cancel_streak"), 1)
+            self.assertEqual(ex.tracker.cancel_streak, 1)
+            self.assertEqual(ex.tracker.placements_today(), 1)
+            self.assertIsNone(ex.tracker.get_cancel(CANCEL_ROW["id"]))
+
+    def test_live_bound_cancel_202_executes_and_counts_streak(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = self._bound_real_gateway(tmp)
+            hybrid = RealGatewayHybrid(real, [live_order(order_id=-5)])
+            ex, kub = self._live_executor(tmp, hybrid)
+            ex.process_cancel_row(dict(CANCEL_ROW), {},
+                                  hybrid.fetch_open_orders())
+            self.assertIn("executed", kub.kinds())
+            self.assertNotIn("failed", kub.kinds())
+            ev = [d for _, k, d in kub.events if k == "executed"][0]
+            self.assertTrue(ev.get("verified_absent"))
+            self.assertEqual(ev.get("cancel_streak"), 1)
+            self.assertEqual(ex.tracker.cancel_streak, 1)
+            self.assertEqual(ex.tracker.placements_today(), 1)
+            self.assertIsNone(ex.tracker.get_cancel(CANCEL_ROW["id"]))
+
+    def test_live_bound_cancel_202_still_present_is_not_executed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = self._bound_real_gateway(tmp)
+            hybrid = RealGatewayHybrid(real, [live_order(order_id=-5)],
+                                       drop_on_cancel=False)
+            ex, kub = self._live_executor(tmp, hybrid)
+            ex.tracker.cancel_streak = 2
+            ex.process_cancel_row(dict(CANCEL_ROW), {},
+                                  hybrid.fetch_open_orders())
+            # The 202 landed, the transmission counted — but the
+            # verification read still shows the target, so the
+            # executor claims nothing: no executed, no failed, the
+            # streak untouched either way, the record left tracked
+            # for reconcile_cancels to resolve.
+            self.assertNotIn("executed", kub.kinds())
+            self.assertNotIn("failed", kub.kinds())
+            self.assertEqual(ex.tracker.cancel_streak, 2)
+            self.assertEqual(ex.tracker.placements_today(), 1)
+            self.assertIsNotNone(ex.tracker.get_cancel(CANCEL_ROW["id"]))
 
 
 if __name__ == "__main__":

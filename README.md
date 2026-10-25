@@ -151,6 +151,11 @@ no what-if for a cancel, so simulate stops at the gates and reports
 `would_execute`. Live mode transmits the cancel under the same
 runaway brake as placements, then verifies on a FRESH open-orders
 read that the target is actually gone before reporting `executed`.
+Note: IB error 202 ("Order Canceled") is the Gateway's
+cancellation *confirmation*, delivered through the error callback
+(v0.3.4) — on both cancel routes a 202 tied to the target order
+counts as the cancel having landed, and the fresh-read
+verification still decides the reported outcome.
 Every cancel, approved or (later) bypassed, lives as a staged row
 and files into Kubera's Closed ledger — no row, no execution, ever.
 

@@ -60,6 +60,37 @@ account):
     transient what-if timeout refused a row before live ever
     saw it. Live gate_failed behaviour is unchanged.
 
+v0.3.4 (2026-10-25): IB error 202 is a cancellation CONFIRMATION,
+  not a failure.
+  * v0.3.3's first live bound-order cancel actually landed: on
+    2026-10-25 the executor transmitted the IREN 37P cancel via
+    the client-0 side-connection and the order vanished from the
+    broker feed (21 -> 20 working orders, verified independently
+    in Kubera). But the row was posted FAILED and the streak left
+    at 0, because IBKR delivers the success word through the
+    error callback as error 202 ("Order Canceled - reason:") and
+    both cancel paths classified every error as a failure.
+  * Classification only, no new mechanics: on BOTH cancel routes
+    (main client for positive session ids, client-0
+    side-connection for negative ones) an error 202 tied to the
+    target session order id — by the pending-slot keying on the
+    main client, by the reqId == target check in the side
+    wrapper — counts as CANCEL LANDED. A 202 tied to any other
+    order id counts for nothing.
+  * The post-transmit fresh-read verification remains the
+    arbiter, unchanged: target absent -> executed + streak;
+    target still present -> the existing unverified path (never
+    an executed claim, no streak increment). Error 202 is NOT
+    added to BENIGN_ERRORS: it is per-order information, not a
+    farm notice, and making it benign would drop the only
+    confirmation some cancels ever send.
+  * Placement-path audit (same mistake class): BENIGN_ERRORS is
+    farm/connectivity notices only; whatif() and transmit() read
+    the same pending slots, but no live misclassification exists
+    there — a 202 against a fresh placement would mean the order
+    itself was cancelled, and transmit() already surfaces the
+    reason verbatim as the rejection. Placements untouched.
+
 v0.3.3 (2026-10-25): a bound order's cancel must be transmitted
   from client 0's side of the fence.
   * The first live cancel under v0.3.2 resolved its target (IREN
@@ -196,7 +227,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -204,6 +235,14 @@ RUNAWAY_MIN_SPACING_SECONDS = 60.0   # min gap between live transmissions
 RUNAWAY_DAILY_CAP = 25               # max live placements per London day
 TERMINAL_STATUSES = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
 BENIGN_ERRORS = {2104, 2106, 2107, 2158, 2119}
+# IB error 202 ("Order Canceled") is not an error on a cancel: it
+# is the Gateway's confirmation that the cancel landed, delivered
+# through the error callback with reqId = the cancelled order's
+# session id (proven live 2026-10-25; see the v0.3.4 docstring
+# block). Deliberately NOT in BENIGN_ERRORS: it is per-order
+# information the cancel paths must classify — and only when it
+# is tied to the target order id.
+CANCEL_CONFIRMED_ERROR_CODE = 202
 UNSET = 1.0e100  # ibapi marks unset doubles with a huge sentinel
 
 
@@ -1126,7 +1165,8 @@ class ExecGateway:
         self.open_orders_event = threading.Event()
         self.next_id = 0
         # orderId -> {"event": Event, "order_state": OrderState|None,
-        #             "status": str, "perm_id": int, "error": str|None}
+        #             "status": str, "perm_id": int, "error": str|None,
+        #             "error_code": int|None}
         self.pending: dict[int, dict] = {}
         outer = self
 
@@ -1208,6 +1248,11 @@ class ExecGateway:
                 slot = outer.pending.get(int(reqId)) if isinstance(reqId, int) else None
                 if slot is not None:
                     slot["error"] = f"IB error {errorCode}: {errorString}"
+                    # The code rides along so a consumer can
+                    # classify it (v0.3.4: the cancel path treats a
+                    # slot-tied 202 as its confirmation). Existing
+                    # consumers read only the string, unchanged.
+                    slot["error_code"] = int(errorCode)
                     slot["event"].set()
                 else:
                     if outer._reading:
@@ -1460,7 +1505,8 @@ class ExecGateway:
             raise AssertionError("whatif() refuses an order without whatIf=True")
         order_id = self._next_order_id()
         self.pending[order_id] = {"event": threading.Event(), "order_state": None,
-                                  "status": "", "perm_id": 0, "error": None}
+                                  "status": "", "perm_id": 0, "error": None,
+                                  "error_code": None}
         try:
             self.client.placeOrder(order_id, contract, order)
             slot = self._await_slot(order_id, timeout=12.0)
@@ -1488,7 +1534,8 @@ class ExecGateway:
             raise AssertionError("transmit() refuses a whatIf order")
         order_id = self._next_order_id()
         self.pending[order_id] = {"event": threading.Event(), "order_state": None,
-                                  "status": "", "perm_id": 0, "error": None}
+                                  "status": "", "perm_id": 0, "error": None,
+                                  "error_code": None}
         try:
             self.client.placeOrder(order_id, contract, order)
             slot = self._await_slot(order_id, timeout=12.0)
@@ -1507,9 +1554,13 @@ class ExecGateway:
         cancel_bound_order). Awaiting the orderStatus callback:
         Cancelled/ApiCancelled is success; an IB error (e.g.
         10147, order not cancellable by this client) is returned
-        verbatim for the caller to surface. on_transmit, when
-        given, fires at the moment the cancelOrder is issued, so
-        the caller's runaway brake counts exactly the real calls."""
+        verbatim for the caller to surface. One error is NOT a
+        refusal: 202 ("Order Canceled") tied to this order id is
+        the Gateway CONFIRMING the cancel (v0.3.4) and counts as
+        success — the caller verifies on a fresh read either way.
+        on_transmit, when given, fires at the moment the
+        cancelOrder is issued, so the caller's runaway brake
+        counts exactly the real calls."""
         order_id = int(order.get("order_id") or 0)
         # Zero means the order never bound to any session.
         if order_id == 0:
@@ -1518,7 +1569,7 @@ class ExecGateway:
         self.pending[order_id] = {"event": threading.Event(),
                                   "order_state": None, "status": "",
                                   "perm_id": int(order.get("perm_id") or 0),
-                                  "error": None}
+                                  "error": None, "error_code": None}
         try:
             if on_transmit is not None:
                 on_transmit()
@@ -1530,6 +1581,11 @@ class ExecGateway:
         finally:
             self.pending.pop(order_id, None)
         if slot["error"]:
+            if slot.get("error_code") == CANCEL_CONFIRMED_ERROR_CODE:
+                # Error 202 in THIS order's slot can only have
+                # arrived with reqId == this order id: it is the
+                # cancellation confirmation, not a failure.
+                return {"ok": True, "status": "Cancelled"}
             return {"ok": False, "error": slot["error"]}
         if slot["status"] in ("Cancelled", "ApiCancelled"):
             return {"ok": True, "status": slot["status"]}
@@ -1560,6 +1616,10 @@ class ExecGateway:
                 # would shadow the error() callback below, and the
                 # ibapi decoder calling it would die on None.
                 self.error_text: str | None = None
+                # The code rides along for classification
+                # (v0.3.4: a target-tied 202 is the cancellation
+                # confirmation, not a refusal).
+                self.error_code: int | None = None
                 self.done = threading.Event()
 
             def nextValidId(self, orderId):
@@ -1589,6 +1649,7 @@ class ExecGateway:
                 if (self.target_id is not None and isinstance(reqId, int)
                         and int(reqId) == self.target_id):
                     self.error_text = f"IB error {errorCode}: {errorString}"
+                    self.error_code = int(errorCode)
                     self.done.set()
 
         wrapper = SideWrapper()
@@ -1699,6 +1760,16 @@ class ExecGateway:
             while not wrapper.done.is_set() and time.monotonic() < deadline:
                 wrapper.done.wait(timeout=0.2)
             if wrapper.error_text:
+                if wrapper.error_code == CANCEL_CONFIRMED_ERROR_CODE:
+                    # Error 202 tied to the target id (the side
+                    # wrapper records errors only for reqId ==
+                    # target): the Gateway is CONFIRMING the
+                    # cancel (v0.3.4) — the exact signal the
+                    # 2026-10-25 live cancel sent and v0.3.3
+                    # misread as a failure. The caller's fresh-read
+                    # verification remains the arbiter.
+                    return {"ok": True, "transmitted": True,
+                            "status": "Cancelled"}
                 return {"ok": False, "transmitted": True,
                         "error": wrapper.error_text}
             if wrapper.status in ("Cancelled", "ApiCancelled"):
