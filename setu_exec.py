@@ -60,6 +60,13 @@ account):
     transient what-if timeout refused a row before live ever
     saw it. Live gate_failed behaviour is unchanged.
 
+v0.3.1 (2026-10-25): Kubera-raised cancel rows carry con_id 0 (the
+  broker-orders feed has no con_id). Identity (C2) is then verified
+  descriptively against the live order's own contract fields
+  (symbol/expiry/strike/right, now captured in the open-orders read),
+  and the orphan premise (C4) keys on the live order's con_id. A row
+  con_id > 0 must still equal the live con_id exactly.
+
 v0.3.0 (2026-10-25): a second staged action — cancel.
   * Kubera staged rows may now carry action="cancel" (contract:
     docs/kubera-cancel-contract.md). A cancel row names ONE working
@@ -127,7 +134,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -539,19 +546,47 @@ def gate_cancel_target(row: dict, open_orders: list[dict]) -> tuple[str, dict]:
 
 
 def gate_cancel_identity(row: dict, order: dict) -> tuple[bool, dict]:
-    """C2: the live order must BE the contract the row names. con_id
-    is the anchor (it encodes symbol/expiry/strike/right); the
-    target action copied at raise time must also match."""
-    if int(order.get("con_id") or 0) != int(row["con_id"]):
+    """C2: the live order must BE the contract the row names. When
+    the row carries a con_id (> 0) it is the anchor and must equal
+    the live order's. Kubera-raised rows carry con_id 0 (the
+    broker-orders feed has no con_id), so identity is then verified
+    descriptively against the live contract itself — symbol,
+    expiry, strike, right — which is what the human saw in the
+    panel. The target action copied at raise time must also match."""
+    row_con = int(row.get("con_id") or 0)
+    if row_con > 0 and int(order.get("con_id") or 0) != row_con:
         return False, {"gate": "identity",
                        "reason": f"live order con_id {order.get('con_id')} "
-                                 f"!= row con_id {row['con_id']}; refusing "
+                                 f"!= row con_id {row_con}; refusing "
                                  f"to cancel a different contract"}
     want = str(row.get("target_action") or "").upper()
     if want and str(order.get("action") or "").upper() != want:
         return False, {"gate": "identity",
                        "reason": f"live order action {order.get('action')} "
                                  f"!= staged target action {want}"}
+    live_symbol = str(order.get("symbol") or "")
+    if live_symbol and str(row.get("symbol") or "").upper() != live_symbol.upper():
+        return False, {"gate": "identity",
+                       "reason": f"live order symbol {live_symbol} "
+                                 f"!= row symbol {row.get('symbol')}"}
+    live_expiry = str(order.get("expiry") or "").replace("-", "")
+    row_expiry = str(row.get("expiry") or "").replace("-", "")
+    if live_expiry and row_expiry and live_expiry != row_expiry:
+        return False, {"gate": "identity",
+                       "reason": f"live order expiry {order.get('expiry')} "
+                                 f"!= row expiry {row.get('expiry')}"}
+    live_strike = to_float(order.get("strike"))
+    row_strike = to_float(row.get("strike"))
+    if live_strike is not None and row_strike is not None and live_strike != row_strike:
+        return False, {"gate": "identity",
+                       "reason": f"live order strike {live_strike} "
+                                 f"!= row strike {row_strike}"}
+    live_right = str(order.get("right") or "").upper()
+    row_right = {"PUT": "P", "CALL": "C"}.get(str(row.get("option_type") or "").upper(), "")
+    if live_right and row_right and live_right != row_right:
+        return False, {"gate": "identity",
+                       "reason": f"live order right {live_right} "
+                                 f"!= row option_type {row.get('option_type')}"}
     return True, {}
 
 
@@ -573,20 +608,24 @@ def gate_cancel_unfilled(order: dict) -> tuple[bool, dict]:
     return True, {}
 
 
-def gate_cancel_premise(row: dict, positions: dict | None) -> tuple[bool, dict]:
+def gate_cancel_premise(row: dict, positions: dict | None,
+                        order: dict) -> tuple[bool, dict]:
     """C4: scanner-raised rows carry the orphan premise — no live
     position behind the order. Re-checked at execute time: if a
     position has appeared for the contract since the raise, the
     premise the approval rested on has changed, so refuse and hand
-    it back. Manual rows skip this gate: the human is the premise."""
+    it back. The position key is the LIVE order's con_id (a
+    Kubera-raised row's own con_id is 0). Manual rows skip this
+    gate: the human is the premise."""
     if str(row.get("source") or "") != "orphan_scan":
         return True, {}
-    pos = (positions or {}).get(int(row["con_id"]))
+    con_id = int(order.get("con_id") or 0) or int(row.get("con_id") or 0)
+    pos = (positions or {}).get(con_id)
     qty = to_float((pos or {}).get("quantity")) or 0.0
     if pos is not None and qty != 0.0:
         return False, {"gate": "premise",
                        "reason": f"a live position for con_id "
-                                 f"{row['con_id']} now exists (qty {qty:g}); "
+                                 f"{con_id} now exists (qty {qty:g}); "
                                  f"the orphan premise no longer holds"}
     return True, {}
 
@@ -619,7 +658,7 @@ def evaluate_cancel_gates(row: dict, positions: dict | None,
     order = detail["order"]
     for gate in (lambda: gate_cancel_identity(row, order),
                  lambda: gate_cancel_unfilled(order),
-                 lambda: gate_cancel_premise(row, positions),
+                 lambda: gate_cancel_premise(row, positions, order),
                  lambda: gate_cancel_not_own(row, order, own_refs)):
         ok, d = gate()
         if not ok:
@@ -1063,6 +1102,10 @@ class ExecGateway:
                 lmt = to_float(getattr(order, "lmtPrice", None))
                 outer.open_orders.append({
                     "con_id": int(to_float(getattr(contract, "conId", 0)) or 0),
+                    "symbol": str(getattr(contract, "symbol", "") or ""),
+                    "expiry": str(getattr(contract, "lastTradeDateOrContractMonth", "") or ""),
+                    "strike": to_float(getattr(contract, "strike", None)),
+                    "right": str(getattr(contract, "right", "") or ""),
                     "action": str(getattr(order, "action", "") or ""),
                     "limit_price": lmt if (lmt is not None and lmt < UNSET) else None,
                     "order_ref": str(getattr(order, "orderRef", "") or ""),

@@ -41,6 +41,10 @@ CANCEL_ROW = {
 def live_order(**over):
     order = {
         "con_id": 111222333,
+        "symbol": "IREN",
+        "expiry": "20261030",
+        "strike": 37.0,
+        "right": "P",
         "action": "Buy",
         "limit_price": 0.45,
         "order_ref": "",
@@ -200,6 +204,43 @@ class CancelGateTests(unittest.TestCase):
         outcome, _ = setu_exec.evaluate_cancel_gates(
             row, {}, [order], {"row-777"})
         self.assertEqual(outcome, "ok")
+
+    # -- con_id 0 rows (Kubera-raised: the feed has no con_id) --------
+    def test_zero_con_id_matches_descriptively(self):
+        row = dict(CANCEL_ROW, con_id=0)
+        outcome, _ = setu_exec.evaluate_cancel_gates(
+            row, {}, [live_order()], set())
+        self.assertEqual(outcome, "ok")
+
+    def test_zero_con_id_strike_mismatch_refuses(self):
+        row = dict(CANCEL_ROW, con_id=0)
+        outcome, detail = setu_exec.evaluate_cancel_gates(
+            row, {}, [live_order(strike=38.0)], set())
+        self.assertEqual(outcome, "refuse")
+        self.assertEqual(detail["gate"], "identity")
+
+    def test_zero_con_id_symbol_mismatch_refuses(self):
+        row = dict(CANCEL_ROW, con_id=0)
+        outcome, detail = setu_exec.evaluate_cancel_gates(
+            row, {}, [live_order(symbol="RKLB")], set())
+        self.assertEqual(outcome, "refuse")
+        self.assertEqual(detail["gate"], "identity")
+
+    def test_zero_con_id_right_mismatch_refuses(self):
+        row = dict(CANCEL_ROW, con_id=0)
+        outcome, detail = setu_exec.evaluate_cancel_gates(
+            row, {}, [live_order(right="C")], set())
+        self.assertEqual(outcome, "refuse")
+        self.assertEqual(detail["gate"], "identity")
+
+    def test_zero_con_id_premise_uses_live_con_id(self):
+        row = dict(CANCEL_ROW, con_id=0)
+        positions = {111222333: {"con_id": 111222333, "quantity": 100.0,
+                                 "avg_cost": 40.0}}
+        outcome, detail = setu_exec.evaluate_cancel_gates(
+            row, positions, [live_order()], set())
+        self.assertEqual(outcome, "refuse")
+        self.assertEqual(detail["gate"], "premise")
 
 
 class NormaliseCancelRowTests(unittest.TestCase):

@@ -16,7 +16,7 @@ A staged row is a cancel when it carries `"action": "cancel"`
 | `id` | Staged row id (as today). One row produces at most one execution, ever. |
 | `account_id` | The IBKR account the order lives in. |
 | `action` | `"cancel"`. |
-| `con_id` | The target order's contract conId (from the positions/orders feed). |
+| `con_id` | 0 for Kubera-raised rows: the broker-orders feed carries no con_id, so the executor resolves the contract from the live order it matches by perm id and verifies the descriptive identity fields (symbol/expiry/strike/type) against that live contract. A row that does carry a con_id > 0 must match it exactly. |
 | `symbol`, `expiry`, `strike`, `option_type` | The contract identity, copied from the broker-orders feed row at raise time (display + identity check). |
 | `target_order_id` | The broker-orders feed's `order_id` for the target — Setu stores the order's **perm id**, globally unique. This is the join key. |
 | `target_action` | `"Buy"` / `"Sell"` from the feed row. |
@@ -39,10 +39,10 @@ rows:
 | `executing` | Executor picked the row up (detail: `mode`). | EXECUTING |
 | `would_execute` | Simulate outcome, OR live deferral (detail `deferred: true`, gate `runaway_brake`), OR simulate gate failure (detail `simulate_gate_failed: true`, `gate`, `reason`). | Back to APPROVED |
 | `gate_failed` | Live gate refusal (detail: `gate`, `reason`). Terminal. | REFUSED |
-| `already_gone` | Target no longer a working order at execute time — the cancel's goal is already met. Terminal no-op. | CLOSED, outcome `already_gone` |
-| `executed` | Cancel transmitted AND verified absent on a fresh open-orders read. Detail: `target_order_id`, `perm_id`, `verified_absent: true`, `approval_mode`, `cancel_streak` (the new value). | CLOSED, outcome `cancelled` |
+| `already_gone` | Target no longer a working order at execute time — the cancel's goal is already met. Terminal no-op. | EXECUTED (Closed ledger), outcome `already_gone` |
+| `executed` | Cancel transmitted AND verified absent on a fresh open-orders read. Detail: `target_order_id`, `perm_id`, `verified_absent: true`, `approval_mode`, `cancel_streak` (the new value). | EXECUTED (Closed ledger), outcome `cancelled` |
 | `failed` | Transmit error (e.g. IB 10147) — detail `reason` verbatim. Terminal. | FAILED |
-| `executed` with `recovered: true` | A tracked cancel resolved on a later read after a restart/unverified transmit. | CLOSED, outcome `cancelled` |
+| `executed` with `recovered: true` | A tracked cancel resolved on a later read after a restart/unverified transmit. | EXECUTED (Closed ledger), outcome `cancelled` |
 
 Notes:
 
