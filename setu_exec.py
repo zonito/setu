@@ -60,6 +60,40 @@ account):
     transient what-if timeout refused a row before live ever
     saw it. Live gate_failed behaviour is unchanged.
 
+v0.3.3 (2026-10-25): a bound order's cancel must be transmitted
+  from client 0's side of the fence.
+  * The first live cancel under v0.3.2 resolved its target (IREN
+    37P, perm 349464471) to session id -5 and transmitted
+    cancelOrder(-5) from the executor's main client 91 — and the
+    Gateway refused with IB error 10147, "OrderId -5 that needs
+    to be cancelled is not found". So bound manual orders live
+    in client 0's namespace: the master client can SEE them in
+    global reads but cannot cancel them. (The Master API Client
+    ID still governs orders placed by other API clients, whose
+    session ids are positive.)
+  * The cancel path now routes by the sign of the resolved
+    session id. Positive: the main client transmits, exactly as
+    before. Negative: a short-lived client-0 side-connection —
+    the same machinery ensure_binding uses — first confirms the
+    target is visible in ITS bound view with the same perm id
+    and session id; only then does it transmit the cancel from
+    there. Not visible there means nothing is transmitted and
+    the failure reason says precisely that.
+  * The runaway brake records a transmission at the moment a
+    cancelOrder is actually issued, whichever connection carries
+    it: the gateway cancel methods take an on_transmit callback
+    the executor supplies. A side session that cannot see its
+    target consumes no slot, keeping the v0.3.2 accounting
+    honest on the new route too. Gates, premise and identity
+    checks, the post-cancel verification read and cancel_streak
+    semantics are all unchanged (a transmitted 10147-class
+    refusal still resets the streak).
+  * Simulate proves the route without transmitting: for a
+    negative-id target it opens the read-only side session,
+    confirms the target in client 0's own view, and reports
+    would_execute with the route and the side session's verdict
+    in the event detail.
+
 v0.3.2 (2026-10-25): cancel reach for manually placed orders, and
   honest brake accounting.
   * The Gateway reports automatic (manually placed) orders to an
@@ -162,7 +196,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -1463,22 +1497,21 @@ class ExecGateway:
         return {"order_id": order_id, "perm_id": slot["perm_id"],
                 "status": slot["status"], "error": slot["error"]}
 
-    def cancel_order(self, order: dict) -> dict:
-        """Live cancel of an EXISTING order (v0.3) — the only cancel
-        call in this program. The target is addressed by the session
-        order id captured in the open-orders read. Awaiting the
-        orderStatus callback: Cancelled/ApiCancelled is success;
-        an IB error (e.g. 10147, order not cancellable by this
-        client) is returned verbatim for the caller to surface.
-        Whether the Gateway lets client 91 cancel another client's
-        order depends on the Master API Client ID setting; that is
-        a setup fact the first live rehearsal proves, and a refusal
-        here is data, not a crash."""
+    def cancel_order(self, order: dict, on_transmit=None) -> dict:
+        """Live cancel of an EXISTING order (v0.3) — addressed by a
+        POSITIVE session order id on this executor's own client
+        (its own placements, or another API client's orders, which
+        the Master API Client ID setting governs). Bound manual
+        orders carry NEGATIVE ids and are NOT reachable here
+        (v0.3.3: they live in client 0's namespace — see
+        cancel_bound_order). Awaiting the orderStatus callback:
+        Cancelled/ApiCancelled is success; an IB error (e.g.
+        10147, order not cancellable by this client) is returned
+        verbatim for the caller to surface. on_transmit, when
+        given, fires at the moment the cancelOrder is issued, so
+        the caller's runaway brake counts exactly the real calls."""
         order_id = int(order.get("order_id") or 0)
-        # Any non-zero id is a valid handle — bound automatic
-        # orders carry NEGATIVE session ids on Gateways with "Use
-        # negative numbers to bind automatic orders" set (v0.3.2).
-        # Zero means the order never bound to this session.
+        # Zero means the order never bound to any session.
         if order_id == 0:
             return {"ok": False,
                     "error": "target order carries no session order id"}
@@ -1487,6 +1520,8 @@ class ExecGateway:
                                   "perm_id": int(order.get("perm_id") or 0),
                                   "error": None}
         try:
+            if on_transmit is not None:
+                on_transmit()
             try:
                 self.client.cancelOrder(order_id, "")
             except TypeError:
@@ -1501,6 +1536,180 @@ class ExecGateway:
         return {"ok": False,
                 "error": f"no cancellation confirmation from the Gateway "
                          f"(last status: {slot['status'] or 'none'})"}
+
+    # -- client-0 side sessions for bound orders (v0.3.3) --------------
+    def _open_client0_view(self, timeout: float = 12.0):
+        """Open a throwaway client-0 side session (the
+        ensure_binding machinery), assert binding there, and read
+        the bound open-orders view AS CLIENT 0 SEES IT. Returns
+        (client, wrapper, view) with view mapping perm id ->
+        session order id, or (None, None, None) when the side
+        session could not complete the read — in which case it has
+        already been disconnected. On success the CALLER owns the
+        session and must disconnect the client."""
+        from ibapi.wrapper import EWrapper
+
+        class SideWrapper(EWrapper):
+            def __init__(self):
+                self.ready = threading.Event()
+                self.view_done = threading.Event()
+                self.view: dict[int, int] = {}  # perm id -> session id
+                self.target_id: int | None = None
+                self.status = ""
+                # NOT "error": an instance attribute by that name
+                # would shadow the error() callback below, and the
+                # ibapi decoder calling it would die on None.
+                self.error_text: str | None = None
+                self.done = threading.Event()
+
+            def nextValidId(self, orderId):
+                self.ready.set()
+
+            def openOrder(self, orderId, contract, order, orderState):
+                perm = int(to_float(getattr(order, "permId", 0)) or 0)
+                if perm:
+                    self.view[perm] = int(orderId)
+
+            def openOrderEnd(self):
+                self.view_done.set()
+
+            def orderStatus(self, orderId, status, filled, remaining,
+                            avgFillPrice, permId=0, parentId=0,
+                            lastFillPrice=0.0, clientId=0, whyHeld="",
+                            mktCapPrice=0.0):
+                if self.target_id is not None and int(orderId) == self.target_id:
+                    self.status = str(status or "")
+                    if self.status in ("Cancelled", "ApiCancelled"):
+                        self.done.set()
+
+            def error(self, reqId, errorCode, errorString,
+                      advancedOrderRejectJson=""):
+                if errorCode in BENIGN_ERRORS:
+                    return
+                if (self.target_id is not None and isinstance(reqId, int)
+                        and int(reqId) == self.target_id):
+                    self.error_text = f"IB error {errorCode}: {errorString}"
+                    self.done.set()
+
+        wrapper = SideWrapper()
+        try:
+            client = self._make_binding_client(wrapper)
+            client.connect(self.cfg["gateway_host"],
+                           int(self.cfg["gateway_port"]), 0)
+        except Exception as exc:
+            log(f"client-0 side-connection failed ({type(exc).__name__}: "
+                f"{exc})")
+            return None, None, None
+        thread = threading.Thread(target=client.run, daemon=True)
+        thread.start()
+
+        def bail():
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            return None, None, None
+
+        if not wrapper.ready.wait(timeout=10):
+            log("client-0 side-connection never became ready")
+            return bail()
+        try:
+            client.reqAutoOpenOrders(True)
+            client.reqAllOpenOrders()
+        except Exception as exc:
+            log(f"client-0 bound read failed ({type(exc).__name__}: {exc})")
+            return bail()
+        if not wrapper.view_done.wait(timeout=timeout):
+            log("client-0 bound read did not complete")
+            return bail()
+        return client, wrapper, dict(wrapper.view)
+
+    @staticmethod
+    def _disconnect(client) -> None:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+
+    def probe_bound_target(self, order: dict) -> dict:
+        """Read-only (v0.3.3): is this bound order visible in
+        client 0's OWN bound view, at the same perm id and session
+        id the main read resolved? Simulate runs this so a WOULD
+        CANCEL claim rests on the route live would actually take.
+        Transmits nothing; the side session only reads."""
+        perm = int(order.get("perm_id") or 0)
+        want = int(order.get("order_id") or 0)
+        client, _wrapper, view = self._open_client0_view()
+        if client is None:
+            return {"visible": False, "order_id": None,
+                    "error": "client-0 side session could not read "
+                             "the bound view"}
+        try:
+            seen = view.get(perm)
+            return {"visible": seen is not None and seen == want,
+                    "order_id": seen, "error": None}
+        finally:
+            self._disconnect(client)
+
+    def cancel_bound_order(self, order: dict, on_transmit=None) -> dict:
+        """Live cancel of a BOUND manual order (v0.3.3) — the
+        transmission rides a short-lived client-0 side-connection,
+        because bound orders live in client 0's namespace: proven
+        live 2026-10-25, when the main client's cancelOrder(-5)
+        was refused with IB error 10147 ("not found") even though
+        its global read showed the order. Before transmitting, the
+        side session confirms the target is visible in ITS bound
+        view with the same perm id and session id; if it is not,
+        nothing is transmitted and the reason says so. The result
+        carries "transmitted" so the caller can tell a real API
+        call from a refusal that never left this machine;
+        on_transmit fires at the moment of the actual call."""
+        order_id = int(order.get("order_id") or 0)
+        perm = int(order.get("perm_id") or 0)
+        if order_id >= 0:
+            return {"ok": False, "transmitted": False,
+                    "error": "cancel_bound_order refuses a non-negative "
+                             "session order id"}
+        client, wrapper, view = self._open_client0_view()
+        if client is None:
+            return {"ok": False, "transmitted": False,
+                    "error": "client-0 side session could not read the "
+                             "bound view; nothing transmitted"}
+        try:
+            seen = view.get(perm)
+            if seen != order_id:
+                return {"ok": False, "transmitted": False,
+                        "error": f"target order not visible in the "
+                                 f"client-0 bound view (perm {perm}: "
+                                 f"session id "
+                                 f"{seen if seen is not None else 'absent'}, "
+                                 f"expected {order_id}); nothing transmitted"}
+            wrapper.target_id = order_id
+            if on_transmit is not None:
+                on_transmit()
+            try:
+                try:
+                    client.cancelOrder(order_id, "")
+                except TypeError:
+                    client.cancelOrder(order_id)
+            except Exception as exc:
+                return {"ok": False, "transmitted": True,
+                        "error": f"{type(exc).__name__}: {exc}"}
+            deadline = time.monotonic() + 12.0
+            while not wrapper.done.is_set() and time.monotonic() < deadline:
+                wrapper.done.wait(timeout=0.2)
+            if wrapper.error_text:
+                return {"ok": False, "transmitted": True,
+                        "error": wrapper.error_text}
+            if wrapper.status in ("Cancelled", "ApiCancelled"):
+                return {"ok": True, "transmitted": True,
+                        "status": wrapper.status}
+            return {"ok": False, "transmitted": True,
+                    "error": f"no cancellation confirmation from the "
+                             f"Gateway (last status: "
+                             f"{wrapper.status or 'none'})"}
+        finally:
+            self._disconnect(client)
 
     def _next_order_id(self) -> int:
         oid = self.next_id
@@ -1793,7 +2002,8 @@ class Executor:
         order = detail["order"]
 
         if self.mode == "simulate":
-            if int(order.get("order_id") or 0) == 0:
+            order_id = int(order.get("order_id") or 0)
+            if order_id == 0:
                 # The target never bound to a session order id, so
                 # a live cancel could not even be addressed
                 # (v0.3.2). Simulate surfaces that as a (never
@@ -1804,12 +2014,38 @@ class Executor:
                     "reason": "target order carries no session order id"},
                     line)
                 return
-            log(f"WOULD CANCEL {line}")
-            self._report(row["id"], "would_execute", {
+            detail = {
                 "target_order_id": row["target_order_id"],
                 "perm_id": order.get("perm_id"),
                 "order_id": order.get("order_id"),
-                "approval_mode": row.get("approval_mode") or "manual"})
+                "approval_mode": row.get("approval_mode") or "manual"}
+            if order_id < 0:
+                # Bound manual order (v0.3.3): live transmits this
+                # cancel from a client-0 side-connection, so
+                # simulate proves the route too — a read-only side
+                # session confirms the target is visible in client
+                # 0's own bound view before any WOULD CANCEL claim.
+                detail["route"] = "client0_side_connection"
+                try:
+                    probe = self.gateway.probe_bound_target(order)
+                except Exception as exc:
+                    probe = {"visible": False, "order_id": None,
+                             "error": f"{type(exc).__name__}: {exc}"}
+                detail["side_session_visible"] = bool(probe.get("visible"))
+                detail["side_session_order_id"] = probe.get("order_id")
+                if not probe.get("visible"):
+                    reason = probe.get("error") or (
+                        f"target not visible in the client-0 bound "
+                        f"view at session id {order_id}")
+                    self._report_cancel_gate_failure(
+                        row, {"gate": "target", "reason": reason}, line)
+                    return
+                log(f"WOULD CANCEL {line} — route: client-0 "
+                    f"side-connection; side session confirmed target "
+                    f"visible at session id {order_id} in its own view")
+            else:
+                log(f"WOULD CANCEL {line}")
+            self._report(row["id"], "would_execute", detail)
             return
 
         # Live: shared runaway brake, deferring exactly like a
@@ -1841,19 +2077,39 @@ class Executor:
                                 "target order carries no session order id")
             return
 
-        # Record BEFORE transmitting so a crash mid-cancel leaves a
-        # trace reconcile_cancels() can resolve next cycle.
+        # Record the tracking row BEFORE transmitting so a crash
+        # mid-cancel leaves a trace reconcile_cancels() can resolve
+        # next cycle. The transmission itself is recorded by the
+        # on_transmit callback at the exact moment a cancelOrder is
+        # issued — on the main client for a positive session id, on
+        # the client-0 side-connection for a bound (negative) one
+        # (v0.3.3) — so the runaway brake counts exactly the real
+        # API calls, never an attempt that died inside a session
+        # that could not see its target.
         self.tracker.add_cancel(row["id"], {
             "target_order_id": row["target_order_id"],
             "perm_id": order.get("perm_id"),
             "con_id": row["con_id"],
             "transmitted": False,
             "staged_at": datetime.now(LONDON).isoformat(timespec="seconds")})
-        self.tracker.record_transmission()
-        self.tracker.cancels[str(row["id"])]["transmitted"] = True
         self.tracker.save()
+
+        def _mark_transmitted() -> None:
+            self.tracker.record_transmission()
+            rec = self.tracker.get_cancel(row["id"])
+            if rec is not None:
+                rec["transmitted"] = True
+            self.tracker.save()
+
         try:
-            result = self.gateway.cancel_order(order)
+            if int(order.get("order_id") or 0) < 0:
+                log(f"CANCEL ROUTE {line} — bound order; transmitting "
+                    f"via the client-0 side-connection")
+                result = self.gateway.cancel_bound_order(
+                    order, on_transmit=_mark_transmitted)
+            else:
+                result = self.gateway.cancel_order(
+                    order, on_transmit=_mark_transmitted)
         except Exception as exc:
             result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         if not result.get("ok"):

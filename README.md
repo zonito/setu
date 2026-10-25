@@ -154,25 +154,38 @@ read that the target is actually gone before reporting `executed`.
 Every cancel, approved or (later) bypassed, lives as a staged row
 and files into Kubera's Closed ledger — no row, no execution, ever.
 
-**Gateway setup for cancels:** two facts make a cancel reachable.
-First, binding (code-side, v0.3.2): unbound, the Gateway reports
-manually placed orders with order id 0 — visible, but with no
-session handle a cancel can address. `reqAutoOpenOrders` binds
-them, but the Gateway accepts that call ONLY from client id 0
-(error 321 for any other client), and binding is sticky account
-state once asserted. So on every connect the executor asserts
-binding through a throwaway client-0 side-connection, then reads
-the bound view on its own connection. Bound orders carry real
-session ids; with the Gateway setting **"Use negative numbers to
-bind automatic orders"** (Gateway → Configure → Settings → API →
-Settings) those ids are negative, which the executor accepts as
-valid cancel handles. That setting is recommended, so bound ids
-can never collide with the session's own id sequence. Second,
-the Master API Client ID: cancelling an order placed by another
-*API client* requires this executor's client id (91) to be the
-account's **Master API Client ID** (same settings page). Without
-it the Gateway refuses with error 10147, which the executor
-surfaces verbatim as the row's failure reason.
+**Gateway setup for cancels:** three facts make a cancel
+reachable. First, binding (code-side, v0.3.2): unbound, the
+Gateway reports manually placed orders with order id 0 —
+visible, but with no session handle a cancel can address.
+`reqAutoOpenOrders` binds them, but the Gateway accepts that
+call ONLY from client id 0 (error 321 for any other client),
+and binding is sticky account state once asserted. So on every
+connect the executor asserts binding through a throwaway
+client-0 side-connection, then reads the bound view on its own
+connection. Bound orders carry real session ids; with the
+Gateway setting **"Use negative numbers to bind automatic
+orders"** (Gateway → Configure → Settings → API → Settings)
+those ids are negative. That setting is recommended, so bound
+ids can never collide with the session's own id sequence.
+Second, the transmit route (v0.3.3): a bound order lives in
+client 0's namespace — the executor's main client can see it in
+global reads, but its `cancelOrder` is refused with error 10147
+("not found"), proven live on 2026-10-25. So a cancel whose
+resolved session id is negative is transmitted from a
+short-lived client-0 side-connection, which first confirms the
+target is visible in its own bound view (same perm id, same
+session id) and transmits nothing when it is not. That is why
+client id 0 must be FREE on the Gateway: run no TWS or other
+client-0 session alongside it, or the side-connection cannot
+be established and bound-order cancels fail with that reason.
+Third, the Master API Client ID: cancelling an order placed by
+another *API client* (positive session ids, transmitted from
+the executor's own client as before) requires this executor's
+client id (91) to be the account's **Master API Client ID**
+(same settings page). Without it the Gateway refuses with
+error 10147, which the executor surfaces verbatim as the row's
+failure reason.
 
 **Phase 2 (after confidence):** when the `cancel_streak` counter in
 `executor-state.json` — reported in every `executed` event — reaches

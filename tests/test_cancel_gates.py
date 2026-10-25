@@ -96,14 +96,25 @@ class FakeKubera:
 
 
 class FakeGateway:
-    """fetch_open_orders reflects cancels: once cancel_order()
-    succeeds, the target disappears from subsequent reads."""
+    """fetch_open_orders reflects cancels: once a cancel succeeds,
+    the target disappears from subsequent reads. Cancels route by
+    session-id sign (v0.3.3): cancel_calls is the MAIN client's
+    transmissions (positive ids), bound_cancel_calls the client-0
+    side-connection's (negative ids). Both honour on_transmit the
+    way the real gateway does — at the moment of the actual call,
+    and only when a call is really made."""
 
-    def __init__(self, positions=None, orders=None, cancel_result=None):
+    def __init__(self, positions=None, orders=None, cancel_result=None,
+                 bound_cancel_result=None, probe_visible=True):
         self.positions = positions or {}
         self.orders = list(orders or [])
         self.cancel_result = cancel_result or {"ok": True, "status": "Cancelled"}
+        self.bound_cancel_result = bound_cancel_result or {
+            "ok": True, "transmitted": True, "status": "Cancelled"}
+        self.probe_visible = probe_visible
         self.cancel_calls = []
+        self.bound_cancel_calls = []
+        self.probe_calls = []
 
     def fetch_positions(self):
         return dict(self.positions)
@@ -111,12 +122,34 @@ class FakeGateway:
     def fetch_open_orders(self):
         return list(self.orders)
 
-    def cancel_order(self, order):
+    def _apply_cancel(self, order):
+        self.orders = [o for o in self.orders
+                       if o.get("perm_id") != order.get("perm_id")]
+
+    def cancel_order(self, order, on_transmit=None):
         self.cancel_calls.append(order)
+        if on_transmit is not None:
+            on_transmit()
         if self.cancel_result.get("ok"):
-            self.orders = [o for o in self.orders
-                           if o.get("perm_id") != order.get("perm_id")]
+            self._apply_cancel(order)
         return dict(self.cancel_result)
+
+    def cancel_bound_order(self, order, on_transmit=None):
+        self.bound_cancel_calls.append(order)
+        result = dict(self.bound_cancel_result)
+        if result.get("transmitted") and on_transmit is not None:
+            on_transmit()
+        if result.get("ok"):
+            self._apply_cancel(order)
+        return result
+
+    def probe_bound_target(self, order):
+        self.probe_calls.append(order)
+        if self.probe_visible:
+            return {"visible": True,
+                    "order_id": order.get("order_id"), "error": None}
+        return {"visible": False, "order_id": None,
+                "error": "target not visible in the client-0 bound view"}
 
 
 def make_executor(tmp, mode="simulate", kubera=None, gateway=None):
@@ -359,8 +392,11 @@ class BoundOrderFlowTests(unittest.TestCase):
             gw = FakeGateway(orders=[order])
             ex, kub, gw = make_executor(tmp, mode="live", gateway=gw)
             ex.process_cancel_row(dict(CANCEL_ROW), {}, gw.fetch_open_orders())
-            self.assertEqual(len(gw.cancel_calls), 1)
-            self.assertEqual(gw.cancel_calls[0].get("order_id"), -4242)
+            # v0.3.3 routing: the transmission rides the client-0
+            # side-connection; the main client never sees it.
+            self.assertEqual(len(gw.bound_cancel_calls), 1)
+            self.assertEqual(gw.bound_cancel_calls[0].get("order_id"), -4242)
+            self.assertEqual(gw.cancel_calls, [])
             self.assertIn("executed", kub.kinds())
             self.assertEqual(ex.tracker.cancel_streak, 1)
             # The one actual transmission is counted, and it starts
@@ -406,6 +442,104 @@ class BoundOrderFlowTests(unittest.TestCase):
             self.assertTrue(detail.get("simulate_gate_failed"))
             self.assertEqual(detail.get("gate"), "target")
             self.assertEqual(gw.cancel_calls, [])
+
+
+class BoundRoutingFlowTests(unittest.TestCase):
+    """v0.3.3: cancels route by the sign of the resolved session
+    id — negative (bound manual orders) ride a client-0
+    side-connection, positive ids stay on the main client — and
+    the runaway brake counts exactly one transmission per actual
+    cancelOrder call, whichever connection carries it."""
+
+    def test_live_positive_id_stays_on_main_client(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = FakeGateway(orders=[live_order()])  # order_id 8811
+            ex, kub, gw = make_executor(tmp, mode="live", gateway=gw)
+            ex.process_cancel_row(dict(CANCEL_ROW), {}, gw.fetch_open_orders())
+            self.assertEqual(len(gw.cancel_calls), 1)
+            self.assertEqual(gw.bound_cancel_calls, [])
+            self.assertEqual(gw.probe_calls, [])
+            self.assertIn("executed", kub.kinds())
+            self.assertEqual(ex.tracker.placements_today(), 1)
+
+    def test_live_bound_side_not_visible_transmits_nothing_no_brake(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            order = live_order(order_id=-4242)
+            gw = FakeGateway(
+                orders=[order],
+                bound_cancel_result={
+                    "ok": False, "transmitted": False,
+                    "error": "target order not visible in the client-0 "
+                             "bound view (perm 349464471: session id "
+                             "absent, expected -4242); nothing transmitted"})
+            ex, kub, gw = make_executor(tmp, mode="live", gateway=gw)
+            ex.tracker.cancel_streak = 2
+            ex.process_cancel_row(dict(CANCEL_ROW), {}, gw.fetch_open_orders())
+            self.assertIn("failed", kub.kinds())
+            self.assertNotIn("executed", kub.kinds())
+            detail = [d for _, k, d in kub.events if k == "failed"][0]
+            self.assertIn("not visible in the client-0 bound view",
+                          detail.get("reason", ""))
+            # The side session WAS consulted, but no cancelOrder was
+            # issued: no brake slot, no spacing clock — and the
+            # failure still resets the streak, like any execution
+            # failure.
+            self.assertEqual(len(gw.bound_cancel_calls), 1)
+            self.assertEqual(gw.cancel_calls, [])
+            self.assertEqual(ex.tracker.placements_today(), 0)
+            ok, _ = ex.tracker.brake_check()
+            self.assertTrue(ok)
+            self.assertEqual(ex.tracker.cancel_streak, 0)
+            self.assertIsNone(ex.tracker.get_cancel(CANCEL_ROW["id"]))
+
+    def test_live_bound_transmitted_refusal_counts_once_and_resets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            order = live_order(order_id=-4242)
+            gw = FakeGateway(
+                orders=[order],
+                bound_cancel_result={
+                    "ok": False, "transmitted": True,
+                    "error": "IB error 10147: OrderId -4242 that needs "
+                             "to be cancelled is not found."})
+            ex, kub, gw = make_executor(tmp, mode="live", gateway=gw)
+            ex.tracker.cancel_streak = 3
+            ex.process_cancel_row(dict(CANCEL_ROW), {}, gw.fetch_open_orders())
+            self.assertIn("failed", kub.kinds())
+            self.assertEqual(ex.tracker.placements_today(), 1)
+            self.assertEqual(ex.tracker.cancel_streak, 0)
+
+    def test_simulate_bound_reports_route_and_side_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            order = live_order(order_id=-4242)
+            ex, kub, gw = make_executor(
+                tmp, gateway=FakeGateway(orders=[order]))
+            ex.process_cancel_row(dict(CANCEL_ROW), {}, gw.fetch_open_orders())
+            self.assertIn("would_execute", kub.kinds())
+            self.assertNotIn("failed", kub.kinds())
+            detail = [d for _, k, d in kub.events if k == "would_execute"][0]
+            self.assertEqual(detail.get("route"), "client0_side_connection")
+            self.assertTrue(detail.get("side_session_visible"))
+            self.assertEqual(detail.get("side_session_order_id"), -4242)
+            self.assertEqual(detail.get("order_id"), -4242)
+            # The probe ran; nothing was transmitted anywhere.
+            self.assertEqual(len(gw.probe_calls), 1)
+            self.assertEqual(gw.cancel_calls, [])
+            self.assertEqual(gw.bound_cancel_calls, [])
+
+    def test_simulate_bound_probe_not_visible_is_nonterminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            order = live_order(order_id=-4242)
+            ex, kub, gw = make_executor(
+                tmp, gateway=FakeGateway(orders=[order], probe_visible=False))
+            ex.process_cancel_row(dict(CANCEL_ROW), {}, gw.fetch_open_orders())
+            kinds = kub.kinds()
+            self.assertIn("would_execute", kinds)
+            self.assertNotIn("failed", kinds)
+            self.assertNotIn("gate_failed", kinds)
+            detail = [d for _, k, d in kub.events if k == "would_execute"][0]
+            self.assertTrue(detail.get("simulate_gate_failed"))
+            self.assertEqual(detail.get("gate"), "target")
+            self.assertEqual(gw.bound_cancel_calls, [])
 
 
 class StubClient:
@@ -513,6 +647,171 @@ class GatewayBindingTests(unittest.TestCase):
             self.assertEqual(result.get("error"),
                              "target order carries no session order id")
             self.assertEqual(stub.cancel_calls, [])
+
+
+class StubSideCancelClient:
+    """Client-0 side-session double for the bound-cancel route
+    (v0.3.3): answers the bound-view read from `view`
+    (perm id -> session id) and completes a cancel synchronously
+    through the wrapper, the way the real Gateway does."""
+
+    def __init__(self, wrapper, view=None, cancel_error=None):
+        from types import SimpleNamespace
+        self._ns = SimpleNamespace
+        self.wrapper = wrapper
+        self.view = {PERM: -5} if view is None else view
+        self.cancel_error = cancel_error  # (code, message) or None
+        self.connect_client_ids = []
+        self.auto_open_calls = []
+        self.cancel_calls = []
+        self.disconnected = False
+
+    def connect(self, host, port, client_id):
+        self.connect_client_ids.append(client_id)
+        self.wrapper.nextValidId(1)
+
+    def run(self):
+        return None
+
+    def disconnect(self):
+        self.disconnected = True
+
+    def reqAutoOpenOrders(self, flag):
+        self.auto_open_calls.append(flag)
+
+    def reqAllOpenOrders(self):
+        for perm, oid in self.view.items():
+            self.wrapper.openOrder(oid, None,
+                                   self._ns(permId=perm), None)
+        self.wrapper.openOrderEnd()
+
+    def cancelOrder(self, order_id, manual_order_cancel_time=""):
+        self.cancel_calls.append(order_id)
+        if self.cancel_error is not None:
+            code, message = self.cancel_error
+            self.wrapper.error(order_id, code, message)
+            return
+        self.wrapper.orderStatus(order_id, "Cancelled", 0.0, 10.0, 0.0,
+                                 permId=PERM)
+
+
+class GatewayBoundCancelTests(unittest.TestCase):
+    """v0.3.3 gateway level: the bound-order cancel route itself,
+    against client doubles. The main client is the StubClient from
+    the binding tests; the side session is StubSideCancelClient."""
+
+    def _gateway(self, tmp, view=None, cancel_error=None):
+        cfg = make_cfg(tmp)
+        gw = setu_exec.ExecGateway(cfg)
+        main = StubClient(gw.wrapper)
+        gw.client = main
+        holder = {}
+
+        def make_client(wrapper):
+            holder["client"] = StubSideCancelClient(
+                wrapper, view=view, cancel_error=cancel_error)
+            return holder["client"]
+
+        gw._make_binding_client = make_client
+        return gw, main, holder
+
+    def test_bound_cancel_gateway_error_surfaces_verbatim(self):
+        # Regression guard: the side wrapper's error() callback
+        # must stay callable (an instance attribute named "error"
+        # would shadow it and the refusal would surface as a
+        # TypeError instead of the Gateway's words).
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, main, holder = self._gateway(
+                tmp, cancel_error=(10147, "OrderId -5 that needs to be "
+                                          "cancelled is not found."))
+            fired = []
+            result = gw.cancel_bound_order(
+                {"order_id": -5, "perm_id": PERM},
+                on_transmit=lambda: fired.append(True))
+            self.assertFalse(result.get("ok"))
+            self.assertTrue(result.get("transmitted"))
+            self.assertIn("10147", result.get("error", ""))
+            self.assertEqual(holder["client"].cancel_calls, [-5])
+            self.assertEqual(fired, [True])
+
+    def test_bound_cancel_transmits_via_client0_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, main, holder = self._gateway(tmp)
+            fired = []
+            result = gw.cancel_bound_order(
+                {"order_id": -5, "perm_id": PERM},
+                on_transmit=lambda: fired.append(True))
+            self.assertTrue(result.get("ok"))
+            self.assertTrue(result.get("transmitted"))
+            side = holder["client"]
+            self.assertEqual(side.connect_client_ids, [0])
+            self.assertEqual(side.cancel_calls, [-5])
+            self.assertTrue(side.disconnected)
+            # The main client never saw a cancelOrder, and the
+            # brake callback fired exactly once.
+            self.assertEqual(main.cancel_calls, [])
+            self.assertEqual(fired, [True])
+
+    def test_bound_cancel_not_visible_transmits_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, main, holder = self._gateway(tmp, view={})
+            fired = []
+            result = gw.cancel_bound_order(
+                {"order_id": -5, "perm_id": PERM},
+                on_transmit=lambda: fired.append(True))
+            self.assertFalse(result.get("ok"))
+            self.assertFalse(result.get("transmitted"))
+            self.assertIn("not visible in the client-0 bound view",
+                          result.get("error", ""))
+            side = holder["client"]
+            self.assertEqual(side.cancel_calls, [])
+            self.assertTrue(side.disconnected)
+            self.assertEqual(main.cancel_calls, [])
+            self.assertEqual(fired, [])
+
+    def test_bound_cancel_wrong_session_id_transmits_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, main, holder = self._gateway(tmp, view={PERM: -9})
+            result = gw.cancel_bound_order({"order_id": -5, "perm_id": PERM})
+            self.assertFalse(result.get("ok"))
+            self.assertFalse(result.get("transmitted"))
+            self.assertEqual(holder["client"].cancel_calls, [])
+
+    def test_bound_cancel_refuses_positive_id_without_a_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, main, holder = self._gateway(tmp)
+            result = gw.cancel_bound_order({"order_id": 8811, "perm_id": PERM})
+            self.assertFalse(result.get("ok"))
+            self.assertFalse(result.get("transmitted"))
+            self.assertNotIn("client", holder)  # no side session opened
+            self.assertEqual(main.cancel_calls, [])
+
+    def test_probe_bound_target_visible_then_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, main, holder = self._gateway(tmp)
+            probe = gw.probe_bound_target({"order_id": -5, "perm_id": PERM})
+            self.assertTrue(probe.get("visible"))
+            self.assertEqual(probe.get("order_id"), -5)
+            self.assertTrue(holder["client"].disconnected)
+            self.assertEqual(main.cancel_calls, [])
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, main, holder = self._gateway(tmp, view={})
+            probe = gw.probe_bound_target({"order_id": -5, "perm_id": PERM})
+            self.assertFalse(probe.get("visible"))
+            self.assertIsNone(probe.get("order_id"))
+
+    def test_main_cancel_order_fires_on_transmit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            gw = setu_exec.ExecGateway(cfg)
+            stub = StubClient(gw.wrapper)
+            gw.client = stub
+            fired = []
+            result = gw.cancel_order({"order_id": 8811, "perm_id": PERM},
+                                     on_transmit=lambda: fired.append(True))
+            self.assertTrue(result.get("ok"))
+            self.assertEqual(stub.cancel_calls, [8811])
+            self.assertEqual(fired, [True])
 
 
 if __name__ == "__main__":
