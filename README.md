@@ -253,6 +253,76 @@ qty reported, and a complete fill posts `filled` with the average
 fill price. A filled cc_open short call then enters the ordinary
 gtc_close coverage loop like any other short.
 
+### Close-now and wing opens (setu-exec v0.5.0)
+
+Two more staged kinds, both staged from the Kubera P2 options-row
+actions and approved in the panel like every other row. Both are
+**manual-approval only**: a bypass-stamped row of either kind is
+refused (`bypass_not_supported`), never acted on. Rows with any
+other unknown kind are still ignored silently.
+
+**`close_now`** — a buy-to-close at the human's limit, staged from
+an option row's Close action. The row's `target_limit` IS the buy
+limit (no 0.40 derivation, no premium in this path) and the row's
+own `tif` governs — GTC or DAY; anything else refuses `bad_tif`.
+Frozen shape: BUY / LMT / row TIF / regular hours / single OPT leg,
+SMART/USD, `orderRef` = the row id.
+
+Gates, in order: armed + kill switch off → fresh complete live
+reads → TIF valid → position real (the short in the row's con_id;
+a smaller live short closes what exists and flags `reduced`,
+exactly like gtc_close; zero refuses `position_missing`) →
+duplicate → price sane (limit > 0, tick-rounded; a rounding change
+is posted in the event detail) → the standard placement what-if
+gate (not the cc conclusive variant) → the shared runaway brake →
+transmit, tracked and reconciled exactly as placements.
+
+The duplicate rule deserves its own paragraph: **any working BUY
+on the contract blocks a close_now**, at any price. Nearly every
+short in this book already carries a resting 60% GTC buy; a
+close_now filling alongside it would buy the position twice over,
+closing the short and flipping it long. The executor refuses with
+`duplicate_open_order` and the reason says what must happen
+instead: the resting buy must be cancelled first (the panel's
+cancel flow does that). Cancel it, re-stage the close, and the
+duplicate gate passes.
+
+**`wing_open`** — a buy-to-open protective leg against a parent
+short, staged from an option row's Wing action. The row names the
+wing leg (symbol / expiry / strike / option_type / `target_limit`
+as the debit cap / qty) and its parent (`parent_con_id`,
+`parent_symbol`, `parent_expiry`, `parent_strike`,
+`parent_option_type`, `parent_quantity`). Frozen shape: BUY / LMT
+/ GTC / regular hours / single OPT leg, SMART/USD, `orderRef` =
+the row id.
+
+Gates, in order: armed + kill switch off → fresh complete live
+reads → parent real (the short in `parent_con_id` is at least the
+wing qty; `parent_position_missing` / `parent_qty_insufficient`
+with the numbers) → wing identity → wing rules → duplicate (any
+working BUY on the resolved wing contract,
+`duplicate_open_order`) → price sane (limit > 0, tick-rounded on
+the resolved contract) → the standard what-if gate → the shared
+runaway brake → transmit, tracked as placements.
+
+Wing identity has two paths because **the wing leg is not held
+yet**: Kubera stores `con_id: 0` for it (a not-yet-held contract
+has no positions-feed identity). A row that carries a con_id has
+it verified via `reqContractDetails` exactly as cc_open verifies.
+A con_id of 0 is **resolved at transmit time** from the leg's own
+fields — exactly one exact match or the row refuses
+(`contract_not_found` / `contract_mismatch`); nothing is ever
+guessed. The transmitted order is built from the verified
+contract, never from the row alone.
+
+The wing rules are **re-verified at transmit** (defence in depth —
+Kubera checks them at staging, the executor never trusts that
+alone): the wing is the same option type as the parent, its strike
+is further OTM than the parent's (a put wing sits below its
+parent, a call wing above), and its expiry is on or after the
+parent's. A violation refuses `wing_rule_violation` naming the
+rule.
+
 ## Config — `~/.setu/config.json`
 
 | Key | Meaning |
