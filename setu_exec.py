@@ -208,6 +208,65 @@ v0.6.0 (2026-10-26): three additions, all in the established
     as resolved_con_id. A row with a real con_id never
     touches the by-spec resolver.
 
+v0.7.0 (2026-10-26): a sixth order kind, open_short —
+  sell-to-open a single-leg option, staged from Kubera's New
+  Short action and as the open leg of a roll pair.
+  Manual-approval rows only (a bypass-stamped open_short row
+  refuses, never acts). Frozen shape: SELL / LMT / GTC /
+  outsideRth False / single OPT leg, SMART / USD, built from
+  the VERIFIED contract, orderRef = the staged row id. The
+  row's con_id may be the 0 sentinel (Kubera's UI stages new
+  shorts unresolved): resolved by spec exactly as the cc /
+  wing sentinels resolve, and the placed / would_place event
+  detail carries resolved_con_id. Gates, in order: armed +
+  kill switch off -> fresh complete live reads -> contract
+  resolved and verified -> duplicate (ANY working SELL on
+  the resolved contract blocks, duplicate_open_order; a
+  second working order already carrying this row's orderRef
+  refuses too) -> price sane (limit > 0, tick-rounded on
+  the verified contract) -> the CONCLUSIVE what-if
+  (gate_cc_whatif with the trailing-rejection grace, never
+  the standard gate: a new short is exactly the order class
+  the IBKR initial-margin 201 trap applies to) -> the shared
+  runaway brake -> transmit, tracked and reconciled exactly
+  as placements. There is deliberately NO position gate: an
+  open_short is a fresh open, and an existing short in the
+  same contract is an ADD, not a conflict.
+  ROLL OPEN LEG: an open_short row carrying parent_row_id
+  is the open half of a roll; Kubera annotates parent_state
+  server-side on every poll and the row's expires_at IS the
+  roll cutoff. Per cycle, BEFORE any event or Gateway work
+  for the row: while parent_state != "FILLED" the row
+  simply waits (total silence — no event, no refusal, no
+  contract read); after the cutoff it also skips (Kubera's
+  sweep owns the expiry). Once the parent shows FILLED the
+  executor arms the leg from its OWN fill tracking: the
+  tracker now retains every tracked order's final fill
+  (avg fill price + filled qty, keyed by row id) in
+  executor state, because the parent close leg was placed
+  by this executor and its fill is captured by the fill
+  sweep. A missing parent fill record refuses
+  arm_fill_unknown (fail closed, never estimate); a
+  PARTIALLY filled parent refuses arm_parent_partial (the
+  roll assumed a fully closed parent; a partial close
+  leaves a residual short the roll did not intend). The arm
+  then resolves the open contract, snapshots it (reqMktData
+  snapshot; a quote-slot error is recorded but never
+  poisons the reads and never completes the slot early —
+  IBKR subscription complaints precede usable delayed
+  ticks) and takes the BID as the open quote: no bid
+  refuses arm_quote_unavailable. Net credit per share =
+  bid - parent avg fill debit; below the row's
+  arm_min_net_credit (0.0 = any non-negative credit)
+  refuses arm_credit_below_floor with the observed credit,
+  floor, bid and debit — terminal. A passing arm continues
+  through the standalone gates from the duplicate check
+  onward, and the placed / would_place detail carries the
+  arm evidence (parent fill price and qty, bid, net
+  credit, floor). In live, any terminal outcome for a roll
+  leg releases the retained parent fill (the dependency
+  has resolved); in simulate nothing is consumed.
+
 v0.3.4 (2026-10-25): IB error 202 is a cancellation CONFIRMATION,
   not a failure.
   * v0.3.3's first live bound-order cancel actually landed: on
@@ -375,7 +434,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -383,6 +442,8 @@ CC_WHATIF_GRACE_SECONDS = 3.0  # v0.4.1: trailing-rejection window after a cc wh
 RUNAWAY_MIN_SPACING_SECONDS = 60.0   # min gap between live transmissions
 RUNAWAY_DAILY_CAP = 25               # max live placements per London day
 TERMINAL_STATUSES = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+FILL_RETENTION_DAYS = 14  # v0.7: how long a tracked fill is retained
+# for dependents (roll open legs) after its order leaves tracking
 BENIGN_ERRORS = {2104, 2106, 2107, 2158, 2119}
 # IB error 202 ("Order Canceled") is not an error on a cancel: it
 # is the Gateway's confirmation that the cancel landed, delivered
@@ -566,6 +627,23 @@ def tick_round_to(price: float, tick: float | None) -> float:
 
 def london_today() -> str:
     return datetime.now(LONDON).strftime("%Y-%m-%d")
+
+
+def parse_iso_datetime(value) -> datetime | None:
+    """Parse an ISO-8601 timestamp (Kubera's expires_at) into an
+    aware datetime; a naive value is read as London time. An
+    unparseable value returns None — the caller treats that as
+    "no local opinion" (Kubera's sweep owns expiry)."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        out = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if out.tzinfo is None:
+        out = out.replace(tzinfo=LONDON)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1629,6 +1707,251 @@ def resolve_cc_contract(row: dict, details: list[dict] | None) -> tuple[bool, di
 
 
 # ---------------------------------------------------------------------------
+# open_short gates (v0.7, unit-tested in tests/test_open_short_gates.py)
+#
+# An open_short row is a plain dict: id, con_id (the option's REAL
+# con_id, or the 0 sentinel Kubera's UI stages — resolved by spec),
+# symbol, expiry (YYYY-MM-DD), strike, option_type ("Put"/"Call"),
+# quantity (positive, contracts to open), target_limit (the sell
+# limit). A ROLL open leg additionally carries parent_row_id (the
+# close leg's staged row id), parent_state (Kubera's server-side
+# annotation of the close leg's state), arm_min_net_credit (the
+# per-share credit floor) and expires_at (the arm cutoff).
+# The what-if gate is NOT here on purpose: an open_short is judged
+# by gate_cc_whatif, the CONCLUSIVE variant — never gate_whatif.
+# ---------------------------------------------------------------------------
+
+def gate_short_contract(row: dict, details: list[dict] | None) -> tuple[bool, dict]:
+    """An open_short row that CARRIES a con_id: the id must resolve
+    to exactly one live contract matching the row's symbol, expiry,
+    strike and right — the wing verification, on the row's own
+    fields (Put or Call per the row)."""
+    con_id = int(row["con_id"])
+    if details is None:
+        return False, {"gate": "contract_not_found",
+                       "reason": f"contract details read failed for "
+                                 f"con_id {con_id}"}
+    if len(details) == 0:
+        return False, {"gate": "contract_not_found",
+                       "reason": f"no contract found for con_id {con_id}"}
+    if len(details) > 1:
+        return False, {"gate": "contract_mismatch",
+                       "reason": f"con_id {con_id} returned "
+                                 f"{len(details)} contracts, expected "
+                                 f"exactly one"}
+    problems = _contract_mismatches(row.get("symbol"), row.get("expiry"),
+                                    row.get("strike"), _row_right(row),
+                                    details[0])
+    if problems:
+        return False, {"gate": "contract_mismatch",
+                       "reason": f"con_id {con_id} contract does not "
+                                 f"match the row: " + "; ".join(problems)}
+    return True, {"verified": details[0]}
+
+
+def resolve_short_contract(row: dict, details: list[dict] | None) -> tuple[bool, dict]:
+    """An open_short row whose con_id is 0 (the Kubera-UI sentinel):
+    resolve it from the by-spec details read — replies filtered to
+    exact matches on symbol / expiry / strike / right (Put or Call
+    per the row) and deduplicated by con_id. Zero distinct
+    contracts refuses contract_not_found, more than one refuses
+    contract_mismatch (an ambiguous contract is never guessed)."""
+    label = (f"{row.get('symbol')} {row.get('expiry')} "
+             f"{row.get('strike')} {row.get('option_type')}")
+    if details is None:
+        return False, {"gate": "contract_not_found",
+                       "reason": f"contract details read failed while "
+                                 f"resolving open_short {label}"}
+    matches: dict[int, dict] = {}
+    for d in details:
+        if _contract_mismatches(row.get("symbol"), row.get("expiry"),
+                                row.get("strike"), _row_right(row), d):
+            continue
+        matches[int(d.get("con_id") or 0)] = d
+    matches.pop(0, None)
+    if len(matches) == 0:
+        return False, {"gate": "contract_not_found",
+                       "reason": f"no contract matches open_short {label}; "
+                                 f"the option does not exist as staged"}
+    if len(matches) > 1:
+        return False, {"gate": "contract_mismatch",
+                       "reason": f"open_short {label} resolved to "
+                                 f"{len(matches)} distinct contracts "
+                                 f"{sorted(matches)}; refusing an "
+                                 f"ambiguous contract"}
+    verified = next(iter(matches.values()))
+    return True, {"verified": verified,
+                  "resolved_con_id": int(verified["con_id"])}
+
+
+def gate_short_duplicate(row: dict, open_orders: list[dict],
+                         con_id: int) -> tuple[bool, dict]:
+    """Never a second working SELL on the short's contract, at any
+    price — one working sell-to-open per contract is the book's
+    shape, and stacking a duplicate is a human decision — and
+    never anything already carrying this row's orderRef (the
+    tracker owns re-placing a transmitted row; a working order
+    with the ref means the transmission already happened)."""
+    ref = str(row["id"])
+    for o in open_orders or []:
+        if str(o.get("order_ref") or "") == ref:
+            return False, {"gate": "duplicate_open_order",
+                           "reason": f"an open order already carries "
+                                     f"orderRef {ref}"}
+        if (int(o.get("con_id") or 0) == int(con_id)
+                and str(o.get("action") or "") == "SELL"
+                and str(o.get("status") or "") not in TERMINAL_STATUSES):
+            return False, {"gate": "duplicate_open_order",
+                           "reason": f"working SELL on con_id {con_id} "
+                                     f"already exists at "
+                                     f"{o.get('limit_price')}; a second "
+                                     f"sell-to-open on the same contract "
+                                     f"is a human decision"}
+    return True, {}
+
+
+def gate_short_price(row: dict, min_tick: float | None) -> tuple[bool, dict]:
+    """The limit IS the order price: it must be positive, and it is
+    tick-rounded on the verified contract's minTick. A rounding
+    change is carried in the detail so the caller posts it."""
+    target = to_float(row.get("target_limit"))
+    if target is None or target <= 0:
+        return False, {"gate": "price",
+                       "reason": f"target_limit {row.get('target_limit')} is "
+                                 f"not a usable short limit (must be > 0)"}
+    limit = tick_round_to(target, min_tick)
+    return True, {"limit": limit, "target_limit": target,
+                  "limit_rounded": abs(limit - target) > 1e-9}
+
+
+def build_short_order_spec(row: dict, verified: dict, limit: float,
+                           what_if: bool) -> dict:
+    """The frozen open_short shape, built from the VERIFIED
+    contract (never from the row alone): SELL / LMT / GTC /
+    regular hours / single OPT leg, SMART/USD, orderRef =
+    staged row id."""
+    mult = to_float(verified.get("multiplier")) or 100.0
+    mult_s = str(int(mult)) if float(mult).is_integer() else str(mult)
+    return {
+        "contract": {
+            "conId": int(verified["con_id"]),
+            "symbol": str(verified.get("symbol") or ""),
+            "secType": "OPT",
+            "exchange": "SMART",
+            "currency": "USD",
+            "lastTradeDateOrContractMonth": str(
+                verified.get("expiry") or "").replace("-", ""),
+            "strike": float(verified.get("strike") or 0.0),
+            "right": str(verified.get("right") or ""),
+            "multiplier": mult_s,
+        },
+        "order": {
+            "action": "SELL",
+            "orderType": "LMT",
+            "totalQuantity": float(row["quantity"]),
+            "lmtPrice": float(limit),
+            "tif": "GTC",
+            "outsideRth": False,
+            "orderRef": str(row["id"]),
+            "whatIf": bool(what_if),
+            "transmit": True,
+        },
+    }
+
+
+def short_line(row: dict, qty: float, limit: float) -> str:
+    pc = "P" if str(row.get("option_type")) == "Put" else "C"
+    strike = row.get("strike")
+    strike_s = f"{strike:g}" if isinstance(strike, (int, float)) else str(strike)
+    return (f"{row.get('symbol')} {row.get('expiry')} {strike_s}{pc} "
+            f"SELL TO OPEN {qty:g} @ {limit:.2f} GTC (row {row.get('id')})")
+
+
+# -- the roll arm (v0.7) ---------------------------------------------------
+
+def gate_arm_fill(fill: dict | None, parent_row_id: str) -> tuple[bool, dict]:
+    """The arm's parent-fill premise, from the executor's OWN fill
+    tracking: the parent close leg was placed by this executor and
+    its final fill was retained by the tracker. No record — or a
+    record with no avg fill price — refuses arm_fill_unknown
+    (fail closed; the debit is NEVER estimated). A parent that
+    filled only PARTIALLY refuses arm_parent_partial with the
+    numbers: the roll contract assumes a fully closed parent,
+    and a partial close leaves a residual short the roll did not
+    intend."""
+    if not fill:
+        return False, {"gate": "arm_fill_unknown",
+                       "reason": f"no retained fill record for parent "
+                                 f"row {parent_row_id}; the arm cannot "
+                                 f"compute the parent debit and never "
+                                 f"estimates it"}
+    avg = to_float(fill.get("avg_fill_price"))
+    filled = to_float(fill.get("filled_qty"))
+    total = to_float(fill.get("total_qty"))
+    if avg is None or filled is None:
+        return False, {"gate": "arm_fill_unknown",
+                       "reason": f"retained fill record for parent row "
+                                 f"{parent_row_id} carries no usable "
+                                 f"avg fill price / filled qty "
+                                 f"(avg={fill.get('avg_fill_price')}, "
+                                 f"filled={fill.get('filled_qty')}); "
+                                 f"refusing to estimate the parent debit"}
+    if total is not None and filled < total - 1e-9:
+        return False, {"gate": "arm_parent_partial",
+                       "reason": f"parent row {parent_row_id} filled "
+                                 f"only {filled:g} of {total:g} "
+                                 f"contracts; a partial close leaves a "
+                                 f"residual short the roll did not "
+                                 f"intend",
+                       "parent_filled_qty": filled,
+                       "parent_total_qty": total,
+                       "parent_avg_fill_price": avg}
+    return True, {"avg_fill_price": avg, "filled_qty": filled,
+                  "total_qty": total}
+
+
+def gate_short_quote(quote: dict | None) -> tuple[bool, dict]:
+    """The arm's live open quote: the snapshot's BID. No snapshot,
+    no bid tick, or a subscription error with no usable price
+    refuses arm_quote_unavailable — the arm never prices a roll
+    off a guess."""
+    if not quote:
+        return False, {"gate": "arm_quote_unavailable",
+                       "reason": "open-contract quote snapshot failed; "
+                                 "no live bid to price the roll arm"}
+    bid = to_float(quote.get("bid"))
+    if bid is None or bid <= 0:
+        reason = ("open-contract quote snapshot carried no usable "
+                  "bid")
+        if quote.get("error"):
+            reason += f" (snapshot error: {quote['error']})"
+        return False, {"gate": "arm_quote_unavailable",
+                       "reason": reason}
+    return True, {"bid": bid}
+
+
+def gate_arm_credit(bid: float, debit: float,
+                    floor: float | None) -> tuple[bool, dict]:
+    """Net credit per share = open bid - parent avg fill debit.
+    Below the row's arm_min_net_credit (0.0 / absent = any
+    non-negative credit arms) refuses arm_credit_below_floor
+    with the observed credit, floor, bid and debit."""
+    floor_v = 0.0 if floor is None else float(floor)
+    credit = round(float(bid) - float(debit), 10)
+    if credit < floor_v - 1e-9:
+        return False, {"gate": "arm_credit_below_floor",
+                       "reason": f"net credit {credit:.2f} per share "
+                                 f"(bid {float(bid):.2f} - parent fill "
+                                 f"debit {float(debit):.2f}) is below "
+                                 f"the roll floor {floor_v:.2f}",
+                       "net_credit": credit, "floor": floor_v,
+                       "open_bid": float(bid),
+                       "parent_avg_fill_price": float(debit)}
+    return True, {"net_credit": credit, "floor": floor_v,
+                  "open_bid": float(bid)}
+
+
+# ---------------------------------------------------------------------------
 # Cancel gates (v0.3, unit-tested in tests/test_cancel_gates.py)
 #
 # A cancel row is a plain dict: the placement fields that identify the
@@ -1895,6 +2218,11 @@ class PlacedTracker:
         self.cancels: dict[str, dict] = {}   # v0.3: staged cancel rows
         self.cancel_streak: int = 0          # v0.3: clean cancel runs
         self.transmissions: list[str] = []  # ISO times of live transmits
+        # v0.7: final fills of tracked orders, keyed by staged row
+        # id — the roll arm's parent-debit source. Retained past
+        # the order's own tracking lifetime, until the dependent
+        # open leg resolves or the record ages out.
+        self.fills: dict[str, dict] = {}
         self.load()
 
     def load(self) -> None:
@@ -1911,11 +2239,17 @@ class PlacedTracker:
             brake = data.get("brake") if isinstance(data, dict) else None
             if isinstance(brake, dict) and isinstance(brake.get("transmissions"), list):
                 self.transmissions = [str(t) for t in brake["transmissions"]]
+            fills = data.get("fills") if isinstance(data, dict) else None
+            if isinstance(fills, dict):
+                self.fills = {str(k): v for k, v in fills.items()
+                              if isinstance(v, dict)}
+            self._prune_fills()
         except (OSError, ValueError):
             self.orders = {}
             self.cancels = {}
             self.cancel_streak = 0
             self.transmissions = []
+            self.fills = {}
 
     def save(self) -> None:
         try:
@@ -1923,10 +2257,39 @@ class PlacedTracker:
                 json.dumps({"placed": self.orders,
                             "cancels": self.cancels,
                             "cancel_streak": self.cancel_streak,
+                            "fills": self.fills,
                             "brake": {"transmissions": self.transmissions}},
                            indent=2), encoding="utf-8")
         except OSError as exc:
             log(f"executor state save failed: {exc}")
+
+    # -- retained fills (v0.7: the roll arm's debit source) ------------
+    def _prune_fills(self, now: datetime | None = None) -> None:
+        """Retained fills older than FILL_RETENTION_DAYS are
+        dropped (a roll leg's cutoff is days at most; a fill older
+        than that can only be a stale dependency). An unparseable
+        filled_at is kept — pruning must never eat a live roll's
+        premise on a formatting guess."""
+        now = now or datetime.now(LONDON)
+        keep_after = now - timedelta(days=FILL_RETENTION_DAYS)
+        stale = []
+        for row_id, rec in self.fills.items():
+            when = parse_iso_datetime(rec.get("filled_at"))
+            if when is not None and when < keep_after:
+                stale.append(row_id)
+        for row_id in stale:
+            self.fills.pop(row_id, None)
+
+    def retain_fill(self, row_id: str, record: dict) -> None:
+        self.fills[str(row_id)] = dict(record)
+        self.save()
+
+    def get_fill(self, row_id: str) -> dict | None:
+        return self.fills.get(str(row_id))
+
+    def drop_fill(self, row_id: str) -> None:
+        if self.fills.pop(str(row_id), None) is not None:
+            self.save()
 
     # -- runaway brake (v0.2: accident insurance, not a trade cap) -----
     def _transmission_times(self) -> list[datetime]:
@@ -2126,6 +2489,18 @@ def normalise_row(raw: dict) -> dict:
         # (absent on option-parent wings and every older row).
         "sec_type": str(raw.get("sec_type") or ""),
         "parent_kind": str(raw.get("parent_kind") or "").strip().lower(),
+        # v0.7: roll open legs. parent_row_id names the roll's
+        # close-leg staged row (absent/empty = a standalone
+        # open_short); parent_state is Kubera's server-side
+        # annotation of the close leg's state on every poll;
+        # arm_min_net_credit is the per-share credit floor the
+        # arm must clear (None/absent = 0.0, any non-negative
+        # credit); expires_at is the row's expiry — for a roll
+        # leg it IS the arm cutoff.
+        "parent_row_id": str(raw.get("parent_row_id") or ""),
+        "parent_state": str(raw.get("parent_state") or ""),
+        "arm_min_net_credit": to_float(raw.get("arm_min_net_credit")),
+        "expires_at": str(raw.get("expires_at") or ""),
         # v0.3: staged action. Absent (every pre-v0.3 row) = "place".
         # A "cancel" row names ONE working order: target_order_id is
         # the broker-orders feed's order id, which Setu stores as the
@@ -2230,6 +2605,9 @@ class ExecGateway:
         # come from a high private sequence so they can never
         # collide with order ids (which the Gateway assigns).
         self.contract_reqs: dict[int, dict] = {}
+        # reqId -> slot for reqMktData snapshots (v0.7, the roll
+        # arm's quote read). Same private id sequence.
+        self.quote_reqs: dict[int, dict] = {}
         self._req_seq = 800000
         # orderId -> {"event": Event, "order_state": OrderState|None,
         #             "status": str, "perm_id": int, "error": str|None,
@@ -2350,6 +2728,29 @@ class ExecGateway:
                 if slot is not None:
                     slot["event"].set()
 
+            def tickPrice(self, reqId, tickType, price, attrib):
+                slot = outer.quote_reqs.get(int(reqId))
+                if slot is None:
+                    return
+                p = to_float(price)
+                if p is None:
+                    return
+                # 1/2/4 = live bid/ask/last; 66/67/68 = the
+                # delayed equivalents (the arm snapshots with the
+                # default market-data type, and a delayed bid is
+                # a usable bid).
+                if int(tickType) in (1, 66):
+                    slot["bid"] = p
+                elif int(tickType) in (2, 67):
+                    slot["ask"] = p
+                elif int(tickType) in (4, 68):
+                    slot["last"] = p
+
+            def tickSnapshotEnd(self, reqId):
+                slot = outer.quote_reqs.get(int(reqId))
+                if slot is not None:
+                    slot["event"].set()
+
             def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
                 if errorCode in BENIGN_ERRORS:
                     return
@@ -2361,6 +2762,20 @@ class ExecGateway:
                     # poison for the positions/orders machinery.
                     cslot["error"] = f"IB error {errorCode}: {errorString}"
                     cslot["event"].set()
+                    return
+                qslot = (outer.quote_reqs.get(int(reqId))
+                         if isinstance(reqId, int) else None)
+                if qslot is not None:
+                    # A quote-slot error is RECORDED, never
+                    # completed and never read poison: IBKR sends
+                    # subscription complaints (e.g. 10091) and
+                    # still delivers usable delayed ticks after
+                    # them. tickSnapshotEnd — or the caller's
+                    # timeout — decides the snapshot; usability
+                    # is the gate's call.
+                    if qslot["error"] is None:
+                        qslot["error"] = (f"IB error {errorCode}: "
+                                          f"{errorString}")
                     return
                 slot = outer.pending.get(int(reqId)) if isinstance(reqId, int) else None
                 if slot is not None:
@@ -2682,6 +3097,48 @@ class ExecGateway:
         contract.right = str(right or "")
         label = (f"spec {symbol} {expiry} {strike:g}{right}")
         return self._fetch_details(contract, label, timeout=timeout)
+
+    def fetch_quote_snapshot(self, verified: dict,
+                             timeout: float = 10.0) -> dict | None:
+        """reqMktData SNAPSHOT for one verified contract (v0.7):
+        the roll arm's live open quote. Returns {"bid", "ask",
+        "last", "error"} with any tick that never arrived left
+        None; a request that RAISED returns None. The snapshot
+        ends on tickSnapshotEnd or the timeout, whichever comes
+        first — an error recorded mid-snapshot (the wrapper
+        routes quote-slot errors here, never into the reads)
+        rides along for the gate's reason but does not end the
+        wait: subscription complaints precede usable delayed
+        ticks. Whether the result is usable is gate_short_quote's
+        decision, not this read's."""
+        from ibapi.contract import Contract
+        contract = Contract()
+        contract.conId = int(verified["con_id"])
+        contract.symbol = str(verified.get("symbol") or "")
+        contract.secType = "OPT"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        req_id = self._alloc_req_id()
+        slot = {"event": threading.Event(), "bid": None, "ask": None,
+                "last": None, "error": None}
+        self.quote_reqs[req_id] = slot
+        try:
+            self.client.reqMktData(req_id, contract, "", True, False, [])
+            if not slot["event"].wait(timeout=timeout):
+                log(f"quote snapshot timed out for con_id "
+                    f"{verified['con_id']}")
+        except Exception as exc:
+            log(f"quote snapshot failed for con_id "
+                f"{verified['con_id']} ({type(exc).__name__}: {exc})")
+            return None
+        finally:
+            self.quote_reqs.pop(req_id, None)
+            try:
+                self.client.cancelMktData(req_id)
+            except Exception:
+                pass
+        return {"bid": slot["bid"], "ask": slot["ask"],
+                "last": slot["last"], "error": slot["error"]}
 
     # -- order calls ------------------------------------------------------
     def _ib_objects(self, spec: dict):
@@ -3158,7 +3615,7 @@ class Executor:
                 continue
             kind = str(row.get("kind") or "gtc_close")
             if kind not in ("gtc_close", "cc_open", "close_now",
-                            "wing_open", "sell_shares"):
+                            "wing_open", "sell_shares", "open_short"):
                 # A kind this build does not understand (v0.4):
                 # ignore the row silently — never errored, never
                 # evented, so a newer Kubera can stage kinds ahead
@@ -3178,6 +3635,8 @@ class Executor:
                     self.process_wing_row(row, positions, open_orders)
             elif kind == "sell_shares":
                 self.process_sell_row(row, positions, open_orders)
+            elif kind == "open_short":
+                self.process_short_row(row, positions, open_orders)
             else:
                 self.process_row(row, positions, open_orders)
 
@@ -3218,6 +3677,29 @@ class Executor:
                             "filled_qty": filled,
                             "remaining": to_float(live.get("remaining")),
                             "avg_fill_price": fill.get("avg_fill_price")})
+                else:
+                    # v0.7: every OTHER kind quietly accumulates
+                    # its running fill (filled qty + sweep avg
+                    # price) into the record, with no event — the
+                    # retained-fill record written at the Filled
+                    # transition is only as good as the last data
+                    # the sweeps carried, and the roll arm reads
+                    # exactly that.
+                    acc = {}
+                    filled = to_float(live.get("filled"))
+                    if (filled is not None
+                            and filled > (to_float(rec.get("filled_qty"))
+                                          or 0.0)):
+                        acc["filled_qty"] = filled
+                    perm = int(live.get("perm_id") or 0)
+                    if perm:
+                        avg = sweep_fill.get(perm, {}).get(
+                            "avg_fill_price")
+                        if avg is not None:
+                            acc["last_avg_fill_price"] = avg
+                    if acc:
+                        self.tracker.update(row_id, **acc)
+                        rec = {**rec, **acc}
                 continue
             # Not in open orders: the latest sweep's orderStatus map may
             # have caught a terminal transition for this perm id.
@@ -3228,6 +3710,33 @@ class Executor:
                     rec = {**rec, "last_status": seen}
             status = str(rec.get("last_status") or "")
             if status == "Filled":
+                # v0.7: retain the final fill in executor state
+                # BEFORE the record is dropped — keyed by row id,
+                # it is the roll arm's parent-debit source and
+                # lives until the dependent open leg resolves (or
+                # ages out). Best available figures win: the
+                # sweep's fill record for this perm, else the
+                # accumulated record fields; a Filled status with
+                # no qty word means the whole quantity filled.
+                fill = sweep_fill.get(int(rec.get("perm_id") or 0), {})
+                total = to_float(rec.get("total_qty"))
+                if total is None:
+                    total = to_float(((rec.get("order") or {})
+                                      .get("order") or {})
+                                     .get("totalQuantity"))
+                filled_qty = to_float(fill.get("filled"))
+                if filled_qty is None:
+                    filled_qty = to_float(rec.get("filled_qty"))
+                if filled_qty is None:
+                    filled_qty = total
+                self.tracker.retain_fill(row_id, {
+                    "avg_fill_price": fill.get("avg_fill_price")
+                    or rec.get("last_avg_fill_price"),
+                    "filled_qty": filled_qty,
+                    "total_qty": total,
+                    "perm_id": rec.get("perm_id"),
+                    "filled_at": datetime.now(LONDON).isoformat(
+                        timespec="seconds")})
                 detail = {"broker_order_id": rec.get("broker_order_id"),
                           "perm_id": rec.get("perm_id")}
                 if rec.get("kind") == "cc_open":
@@ -3413,6 +3922,39 @@ class Executor:
         self._notify("setu-exec: gate refusal",
                      f"{self.account} {line} — refused at gate "
                      f"[{detail.get('gate')}]: {detail.get('reason')}")
+
+    def _report_short_gate_failure(self, row: dict, detail: dict,
+                                   line: str,
+                                   extra: dict | None = None) -> None:
+        """open_short gate verdicts (v0.7), mode-appropriate exactly
+        like the other placement kinds: simulate failures are NOT
+        terminal (posted as would_place with a simulate_gate_failed
+        detail carrying the kind, returning the row to APPROVED),
+        live failures are gate_failed plus the refusal Pushover.
+        extra carries the sentinel's resolved_con_id and, for a
+        roll leg, the arm evidence into the event detail. A LIVE
+        terminal verdict for a roll leg also releases the retained
+        parent fill: the dependency has resolved, and keeping the
+        record would let a later leg price off a stale debit."""
+        extra = extra or {}
+        if self.mode == "simulate":
+            log(f"SIMULATE GATE FAILED [{detail.get('gate')}] {line}"
+                f" — {detail.get('reason')}")
+            self._report(row["id"], "would_place", {
+                "simulate_gate_failed": True,
+                "gate": detail.get("gate"),
+                "reason": detail.get("reason"),
+                "kind": "open_short", **extra})
+            return
+        log(f"GATE FAILED [{detail.get('gate')}] {line}"
+            f" — {detail.get('reason')}")
+        self._report(row["id"], "gate_failed", {**detail, **extra})
+        self._notify("setu-exec: gate refusal",
+                     f"{self.account} {line} — refused at gate "
+                     f"[{detail.get('gate')}]: {detail.get('reason')}")
+        parent_id = str(row.get("parent_row_id") or "")
+        if parent_id:
+            self.tracker.drop_fill(parent_id)
 
     def _cancel_failed(self, row: dict, line: str, error) -> None:
         """A cancel execution failure (v0.3): log it, file the
@@ -3762,6 +4304,234 @@ class Executor:
         out = {"broker_order_id": result.get("order_id"),
                "perm_id": result.get("perm_id"), "order": spec,
                "kind": "cc_open", **res_extra}
+        if detail["limit_rounded"]:
+            out["limit_rounded_from"] = detail["target_limit"]
+        self._report(row["id"], "placed", out)
+        self._notify("setu-exec: order placed",
+                     f"{self.account} {line} — PLACED order "
+                     f"{result.get('order_id')} perm {result.get('perm_id')}")
+
+    # -- one staged short open row (v0.7) ---------------------------------
+    def process_short_row(self, row: dict, positions: dict[int, dict] | None,
+                          open_orders: list[dict] | None) -> None:
+        parent_id = str(row.get("parent_row_id") or "")
+        if parent_id:
+            # ROLL OPEN LEG — the wait, checked BEFORE any event or
+            # Gateway work for the row: while the parent close leg
+            # is not FILLED the leg simply waits (no event, no
+            # refusal, no contract read). Past the cutoff it also
+            # skips — the row's expires_at IS the cutoff and
+            # Kubera's sweep owns the expiry.
+            if str(row.get("parent_state") or "") != "FILLED":
+                return
+            cutoff = parse_iso_datetime(row.get("expires_at"))
+            if cutoff is not None and datetime.now(LONDON) >= cutoff:
+                return
+        line = short_line(row, row["quantity"], row["target_limit"] or 0)
+        placing = {"mode": self.mode, "kind": "open_short"}
+        if parent_id:
+            placing["parent_row_id"] = parent_id
+        self._report(row["id"], "placing", placing)
+        if positions is None or open_orders is None:
+            # Defence in depth, as every placement kind: never
+            # gate on partial data.
+            detail = {"gate": "reads_incomplete",
+                      "reason": "live Gateway reads did not complete; "
+                                "refusing to evaluate gates on partial data"}
+            self._report_short_gate_failure(row, detail, line)
+            return
+        if str(row.get("approval_mode") or "") == "bypass":
+            # open_short is manual-approval only: a bypass stamp
+            # is a gate failure, never an instruction to act.
+            detail = {"gate": "bypass_not_supported",
+                      "reason": "open_short rows are manual-approval only; "
+                                "a bypass-stamped open_short row is "
+                                "refused, never acted on"}
+            self._report_short_gate_failure(row, detail, line)
+            return
+        arm = None
+        if parent_id:
+            # Arm step 2: the parent debit, from the executor's
+            # OWN retained fill tracking — never estimated.
+            ok, fdetail = gate_arm_fill(self.tracker.get_fill(parent_id),
+                                        parent_id)
+            if not ok:
+                self._report_short_gate_failure(row, fdetail, line)
+                return
+            arm = {"parent_row_id": parent_id,
+                   "parent_avg_fill_price": fdetail["avg_fill_price"],
+                   "parent_filled_qty": fdetail["filled_qty"],
+                   "parent_total_qty": fdetail["total_qty"]}
+        # Contract resolve / verify — shared by the standalone row
+        # and the roll arm (arm step 3): a carried con_id is
+        # verified; the 0 sentinel resolves by spec, exactly as
+        # the cc / wing sentinels resolve.
+        resolved_con_id = None
+        if int(row["con_id"]) == 0:
+            try:
+                spec_details = self.gateway.fetch_contract_details_by_spec(
+                    str(row.get("symbol") or ""),
+                    str(row.get("expiry") or ""),
+                    float(row.get("strike") or 0.0), _row_right(row))
+            except Exception as exc:
+                log(f"contract resolution raised for open_short "
+                    f"{row.get('symbol')} {row.get('expiry')} "
+                    f"{row.get('strike')} ({type(exc).__name__}: {exc})")
+                spec_details = None
+            ok, detail = resolve_short_contract(row, spec_details)
+            if not ok:
+                self._report_short_gate_failure(row, detail, line, arm)
+                return
+            resolved_con_id = detail["resolved_con_id"]
+            verified = detail["verified"]
+            row = {**row, "con_id": resolved_con_id}
+            log(f"open_short sentinel resolved: {row.get('symbol')} "
+                f"{row.get('expiry')} {row.get('strike')}"
+                f"{_row_right(row)} -> con_id {resolved_con_id}")
+        else:
+            try:
+                details = self.gateway.fetch_contract_details(
+                    int(row["con_id"]))
+            except Exception as exc:
+                log(f"contract details raised for con_id {row['con_id']} "
+                    f"({type(exc).__name__}: {exc})")
+                details = None
+            ok, detail = gate_short_contract(row, details)
+            if not ok:
+                self._report_short_gate_failure(row, detail, line, arm)
+                return
+            verified = detail["verified"]
+        res_extra = ({"resolved_con_id": resolved_con_id}
+                     if resolved_con_id is not None else {})
+        extra = {**res_extra, **(arm or {})}
+        if parent_id:
+            # Arm step 4: the live open quote (the snapshot's BID)
+            # and the credit floor.
+            try:
+                quote = self.gateway.fetch_quote_snapshot(verified)
+            except Exception as exc:
+                log(f"quote snapshot raised for con_id "
+                    f"{verified['con_id']} ({type(exc).__name__}: {exc})")
+                quote = None
+            ok, qdetail = gate_short_quote(quote)
+            if not ok:
+                self._report_short_gate_failure(row, qdetail, line, extra)
+                return
+            bid = qdetail["bid"]
+            ok, cdetail = gate_arm_credit(
+                bid, arm["parent_avg_fill_price"],
+                row.get("arm_min_net_credit"))
+            if not ok:
+                self._report_short_gate_failure(row, cdetail, line, extra)
+                return
+            arm.update({"open_bid": bid,
+                        "net_credit": cdetail["net_credit"],
+                        "arm_min_net_credit": cdetail["floor"]})
+            extra = {**res_extra, **arm}
+        # Standalone gates from here (arm step 5 for a roll leg):
+        # duplicate, price, the CONCLUSIVE what-if. There is no
+        # position gate — an existing short in the same contract
+        # is an add, not a conflict.
+        ok, detail = gate_short_duplicate(row, open_orders,
+                                          int(row["con_id"]))
+        if not ok:
+            self._report_short_gate_failure(row, detail, line, extra)
+            return
+        ok, detail = gate_short_price(row, to_float(verified.get("min_tick")))
+        if not ok:
+            self._report_short_gate_failure(row, detail, line, extra)
+            return
+        limit = detail["limit"]
+        line = short_line(row, row["quantity"], limit)
+
+        preview = build_short_order_spec(row, verified, limit,
+                                         what_if=True)
+        try:
+            # The what-if must be CONCLUSIVE (gate_cc_whatif with
+            # whatif_cc's trailing grace) — the standard gate is
+            # never used for this kind: a new short is exactly the
+            # order class the IBKR 201 trap applies to.
+            reply = self.gateway.whatif_cc(preview)
+        except Exception as exc:
+            reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        ok, wdetail = gate_cc_whatif(reply)
+        if not ok:
+            self._report_short_gate_failure(row, wdetail, line, extra)
+            return
+
+        if self.mode == "simulate":
+            log(f"WOULD PLACE {line}")
+            out = {"order": preview, "whatif": wdetail["whatif"],
+                   "kind": "open_short", "limit": limit, **extra}
+            if detail["limit_rounded"]:
+                out["limit_rounded_from"] = detail["target_limit"]
+            self._report(row["id"], "would_place", out)
+            return
+
+        # Live: shared runaway brake, deferring exactly like a
+        # placement (the row returns to APPROVED via would_place;
+        # a deferred roll leg keeps its parent fill — nothing has
+        # resolved yet).
+        brake_ok, brake_reason = self.tracker.brake_check()
+        if not brake_ok:
+            wait = self.tracker.brake_wait_seconds()
+            if wait is not None:
+                log(f"RUNAWAY BRAKE [defer] {line} — {brake_reason}; "
+                    f"retry in ~{wait:.0f}s, row left APPROVED")
+            else:
+                log(f"RUNAWAY BRAKE [defer] {line} — {brake_reason}; "
+                    f"row left APPROVED until the daily count resets")
+            self._report(row["id"], "would_place", {
+                "deferred": True, "gate": "runaway_brake",
+                "reason": brake_reason, "kind": "open_short", **extra})
+            return
+        spec = build_short_order_spec(row, verified, limit,
+                                      what_if=False)
+        # Record BEFORE transmitting, counted before the attempt —
+        # the placement discipline exactly (see process_cc_row).
+        self.tracker.add(row["id"], {
+            "order_ref": str(row["id"]), "account": self.account,
+            "kind": "open_short",
+            "confirmed": False, "broker_order_id": None, "perm_id": None,
+            "last_status": "",
+            "placed_at": datetime.now(LONDON).isoformat(timespec="seconds"),
+            "order": spec, "filled_qty": 0.0,
+            "total_qty": float(row["quantity"]),
+            "last_avg_fill_price": None})
+        self.tracker.record_transmission()
+        if parent_id:
+            # The leg has transmitted; the retained parent fill
+            # has served its purpose.
+            self.tracker.drop_fill(parent_id)
+        try:
+            result = self.gateway.transmit(spec)
+        except Exception as exc:
+            result = {"order_id": None, "perm_id": 0, "status": "",
+                      "error": f"{type(exc).__name__}: {exc}"}
+        if result.get("error"):
+            log(f"PLACEMENT REJECTED {line} — {result['error']}")
+            self._report(row["id"], "rejected",
+                         {"reason": result["error"], "order": spec,
+                          "kind": "open_short", **extra})
+            self.tracker.drop(row["id"])
+            return
+        if not result.get("status") and not result.get("perm_id"):
+            log(f"PLACED (unconfirmed) {line} — no Gateway reply yet; "
+                f"tracking by orderRef")
+            self._notify("setu-exec: order placed (unconfirmed)",
+                         f"{self.account} {line} — transmitted, no Gateway "
+                         f"confirmation yet; tracked by orderRef")
+            return
+        self.tracker.update(row["id"], confirmed=True,
+                            broker_order_id=result.get("order_id"),
+                            perm_id=result.get("perm_id") or None,
+                            last_status=result.get("status") or "",
+                            last_avg_fill_price=result.get("avg_fill_price"))
+        log(f"PLACED {line} — order {result.get('order_id')} "
+            f"perm {result.get('perm_id')}")
+        out = {"broker_order_id": result.get("order_id"),
+               "perm_id": result.get("perm_id"), "order": spec,
+               "kind": "open_short", **extra}
         if detail["limit_rounded"]:
             out["limit_rounded_from"] = detail["target_limit"]
         self._report(row["id"], "placed", out)

@@ -395,6 +395,81 @@ contract verification, cover, duplicate, the conclusive what-if
 — with the resolved id, which the placed / would_place event
 detail carries as `resolved_con_id`.
 
+### Short opens and the roll arm (setu-exec v0.7.0)
+
+**`open_short`** — sell-to-open a single-leg option (Put or Call
+per the row), staged from Kubera's New Short action and as the
+open leg of a roll pair. **Manual-approval only** (a
+bypass-stamped row refuses, never acts). Frozen shape: SELL /
+LMT / GTC / regular hours / single OPT leg, SMART/USD, built
+from the **verified** contract, `orderRef` = the row id. The
+row's `con_id` may be the 0 sentinel (the UI stages new shorts
+unresolved): resolved **by spec** exactly as the cc / wing
+sentinels resolve — zero matches refuses `contract_not_found`,
+more than one distinct contract refuses `contract_mismatch` —
+and the placed / would_place detail carries `resolved_con_id`.
+
+Gates, in order: armed + kill switch off → fresh complete live
+reads → contract resolved and verified → duplicate (any working
+SELL on the resolved contract blocks, `duplicate_open_order`;
+an order already carrying this row's `orderRef` blocks too) →
+price sane (limit > 0, tick-rounded on the verified contract) →
+the **conclusive** what-if (`gate_cc_whatif` with the
+trailing-rejection grace — never the standard gate: a new short
+is exactly the order class the IBKR initial-margin 201 trap
+applies to) → the shared runaway brake → transmit, tracked and
+reconciled exactly as placements.
+
+There is deliberately **no position gate**: an open_short is a
+fresh open, and an existing short in the same contract does
+**not** block — opening more of the same contract is an add,
+which is the operator's decision at approval time, not the
+executor's to second-guess.
+
+**The roll arm.** An `open_short` row carrying `parent_row_id`
+is the open half of a roll pair. Kubera annotates
+`parent_state` server-side on every poll, and the row's
+`expires_at` **is** the roll cutoff. Per cycle, before any event
+or Gateway work for the row:
+
+- `parent_state != "FILLED"` → the leg **waits in total
+  silence** (no event, no refusal, no contract read).
+- Past the cutoff → also skipped; Kubera's sweep owns the
+  expiry.
+- `parent_state == "FILLED"` → the arm evaluates, in order:
+  1. **Parent fill debit**, from the executor's **own** fill
+     tracking: every tracked order's final fill (avg fill price
+     + filled qty) is retained in executor state, keyed by row
+     id, until its dependents resolve (pruned after 14 days).
+     No record refuses `arm_fill_unknown` — fail closed, the
+     debit is never estimated. A **partially** filled parent
+     refuses `arm_parent_partial` with the numbers: the roll
+     assumed a fully closed parent, and a partial close leaves
+     a residual short the roll did not intend.
+  2. **Resolve/verify** the open contract (sentinel rules as
+     standalone).
+  3. **Live open quote**: a `reqMktData` snapshot of the
+     resolved contract; the **bid** is the open quote. No bid,
+     an empty snapshot, or a subscription error with no usable
+     price refuses `arm_quote_unavailable`. (A quote-slot error
+     is recorded but never poisons the positions/orders reads
+     and never ends the snapshot early — IBKR subscription
+     complaints precede usable delayed ticks.)
+  4. **Credit floor**: net credit per share = bid − parent avg
+     fill debit. Below the row's `arm_min_net_credit`
+     (0.0 = any non-negative credit arms) refuses
+     `arm_credit_below_floor` with the observed credit, floor,
+     bid and debit — terminal.
+  5. A passing arm continues through the standalone gates from
+     the duplicate check onward and transmits; the placed /
+     would_place detail carries the **arm evidence** (parent
+     fill price and qty, bid, net credit, floor).
+
+In live, any terminal outcome for a roll leg releases the
+retained parent fill (the dependency has resolved); in simulate
+nothing is consumed. A FILLED parent in a mock poll evaluates
+identically but transmits nothing.
+
 ## Config — `~/.setu/config.json`
 
 | Key | Meaning |
