@@ -198,7 +198,7 @@ the agreed bar, Kubera may stamp scanner rows
 `approval_mode: "bypass"` and approve them without a human wait. The
 executor treats those rows identically; every gate still applies.
 
-### Covered-call opens (setu-exec v0.4.0)
+### Covered-call opens (setu-exec v0.4.0; conclusive what-if v0.4.1)
 
 Staged rows may carry `kind: "cc_open"` — the mirror flow for the
 covered-call spike harvest. A cc_open row is a resting SELL-TO-OPEN
@@ -230,6 +230,18 @@ tick-rounded on the verified contract's minTick; a rounding change
 is posted in the event detail) → what-if succeeds and initial
 margin does not rise by more than +$50 (`margin_impact`). Then the
 shared runaway brake and the transmit, exactly as placements.
+
+**The cc_open what-if must be conclusive (v0.4.1).** A what-if
+that completes without a concrete initial-margin figure refuses
+as `whatif_inconclusive` — observed live (2026-10-26) that shape
+can mean the broker refused to price the hypothetical, with the
+refusal arriving as an asynchronous IB error 201 just after the
+reply. The cc what-if therefore also holds a 3-second
+trailing-rejection grace: an error tied to the what-if order id
+inside that window flips the verdict to `margin_impact` with the
+broker's message verbatim in the reason. The executor never
+transmits a cc_open order on an inconclusive what-if. (The
+gtc_close what-if path is unchanged.)
 
 **Approval is manual only in v1:** if a cc_open row ever arrives
 stamped `approval_mode: "bypass"` the executor refuses it

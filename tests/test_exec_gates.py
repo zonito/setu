@@ -276,10 +276,18 @@ class OrderSpecTests(unittest.TestCase):
 
     def test_only_two_place_order_calls_both_guarded(self):
         src = Path(setu_exec.__file__).read_text(encoding="utf-8")
-        self.assertEqual(len(re.findall(r"\.placeOrder\s*\(", src)), 2,
-                         "whatif + transmit are the only order calls")
+        # v0.4.1 adds a third door: whatif_cc, the cc_open what-if
+        # with a trailing-rejection grace. It is guarded by the
+        # same AssertionError shape as whatif (never transmits:
+        # whatIf=True or it refuses the call), so the census moves
+        # to 3 and the guard assertion below covers it too.
+        self.assertEqual(len(re.findall(r"\.placeOrder\s*\(", src)), 3,
+                         "whatif + whatif_cc + transmit are the only "
+                         "order calls")
         self.assertIn('if not order.whatIf:', src)
         self.assertIn('if order.whatIf:', src)
+        self.assertIn("whatif_cc() refuses an order without whatIf=True",
+                      src)
 
 
 class ModeAndArmTests(unittest.TestCase):

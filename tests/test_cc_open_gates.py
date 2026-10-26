@@ -9,6 +9,8 @@ import copy
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,6 +169,13 @@ class FakeGatewayCC:
         return [dict(d) for d in self.details]
 
     def whatif(self, spec):
+        self.whatif_specs.append(copy.deepcopy(spec))
+        return dict(self.whatif_reply)
+
+    def whatif_cc(self, spec):
+        # v0.4.1: the cc path's conclusive what-if. The fake serves
+        # the same canned reply (which may carry late_error /
+        # figure-less shapes for the refusal tests).
         self.whatif_specs.append(copy.deepcopy(spec))
         return dict(self.whatif_reply)
 
@@ -518,6 +527,134 @@ class CcFlowTests(unittest.TestCase):
             self.assertEqual(would[0][2]["gate"], "reads_incomplete")
 
 
+NULL_FIGURES_REPLY = {
+    "ok": True, "init_margin_change": None, "maint_margin_change": None,
+    "equity_with_loan_change": None, "commission": None}
+
+BROKER_201 = ("IB error 201: YOUR ORDER IS NOT ACCEPTED. IN ORDER TO "
+              "OBTAIN THE DESIRED POSITION YOUR EQUITY WITH LOAN VALUE "
+              "[546819.78 USD] MUST EXCEED THE INITIAL MARGIN "
+              "[559501.74 USD]")
+
+
+class CcWhatifGateFunctionTests(unittest.TestCase):
+    """gate_cc_whatif (v0.4.1): conclusive or refused."""
+
+    def test_failed_reply_is_margin_impact(self):
+        ok, detail = setu_exec.gate_cc_whatif(
+            {"ok": False, "error": "IB error 321: bad contract"})
+        self.assertFalse(ok)
+        self.assertEqual(detail["gate"], "margin_impact")
+        self.assertIn("what-if failed", detail["reason"])
+
+    def test_null_init_margin_is_inconclusive(self):
+        ok, detail = setu_exec.gate_cc_whatif(dict(NULL_FIGURES_REPLY))
+        self.assertFalse(ok)
+        self.assertEqual(detail["gate"], "whatif_inconclusive")
+        self.assertIn("init_margin_change=None", detail["reason"])
+
+    def test_late_error_is_margin_impact_verbatim(self):
+        reply = {"ok": True, "init_margin_change": -120.0,
+                 "maint_margin_change": -60.0,
+                 "equity_with_loan_change": 0.0, "commission": None,
+                 "late_error": BROKER_201, "late_error_code": 201}
+        ok, detail = setu_exec.gate_cc_whatif(reply)
+        self.assertFalse(ok)
+        self.assertEqual(detail["gate"], "margin_impact")
+        self.assertEqual(detail["reason"], BROKER_201)
+
+    def test_over_tolerance_is_margin_impact(self):
+        ok, detail = setu_exec.gate_cc_whatif(
+            {"ok": True, "init_margin_change": 500.0,
+             "maint_margin_change": 0.0, "equity_with_loan_change": 0.0,
+             "commission": None, "late_error": None})
+        self.assertFalse(ok)
+        self.assertEqual(detail["gate"], "margin_impact")
+
+    def test_concrete_within_tolerance_quiet_grace_passes(self):
+        reply = {"ok": True, "init_margin_change": -120.0,
+                 "maint_margin_change": -60.0,
+                 "equity_with_loan_change": 0.0, "commission": None,
+                 "late_error": None, "late_error_code": None}
+        ok, detail = setu_exec.gate_cc_whatif(reply)
+        self.assertTrue(ok)
+        self.assertEqual(detail["whatif"], reply)
+
+
+class CcWhatifProcessTests(unittest.TestCase):
+    """The executor's cc path on the new what-if shapes, both modes."""
+
+    def test_null_margin_whatif_refused_simulate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera = FakeKubera()
+            gw = FakeGatewayCC(whatif_reply=dict(NULL_FIGURES_REPLY))
+            make_executor(tmp, kubera, gw).cycle()
+            would = events_of(kubera, "would_place")
+            self.assertEqual(len(would), 1)
+            self.assertTrue(would[0][2]["simulate_gate_failed"])
+            self.assertEqual(would[0][2]["gate"], "whatif_inconclusive")
+            self.assertEqual(gw.transmit_specs, [])
+
+    def test_null_margin_whatif_refused_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera = FakeKubera()
+            gw = FakeGatewayCC(whatif_reply=dict(NULL_FIGURES_REPLY))
+            make_executor(tmp, kubera, gw, mode="live",
+                          live_file=True).cycle()
+            failed = events_of(kubera, "gate_failed")
+            self.assertEqual(len(failed), 1)
+            self.assertEqual(failed[0][2]["gate"], "whatif_inconclusive")
+            self.assertEqual(gw.transmit_specs, [])
+
+    def test_late_201_refused_simulate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera = FakeKubera()
+            gw = FakeGatewayCC(whatif_reply={
+                "ok": True, "init_margin_change": -120.0,
+                "maint_margin_change": -60.0,
+                "equity_with_loan_change": 0.0, "commission": None,
+                "late_error": BROKER_201, "late_error_code": 201})
+            make_executor(tmp, kubera, gw).cycle()
+            would = events_of(kubera, "would_place")
+            self.assertEqual(len(would), 1)
+            self.assertTrue(would[0][2]["simulate_gate_failed"])
+            self.assertEqual(would[0][2]["gate"], "margin_impact")
+            self.assertIn("YOUR ORDER IS NOT ACCEPTED",
+                          would[0][2]["reason"])
+            self.assertEqual(gw.transmit_specs, [])
+
+    def test_late_201_refused_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera = FakeKubera()
+            gw = FakeGatewayCC(whatif_reply={
+                "ok": True, "init_margin_change": -120.0,
+                "maint_margin_change": -60.0,
+                "equity_with_loan_change": 0.0, "commission": None,
+                "late_error": BROKER_201, "late_error_code": 201})
+            make_executor(tmp, kubera, gw, mode="live",
+                          live_file=True).cycle()
+            failed = events_of(kubera, "gate_failed")
+            self.assertEqual(len(failed), 1)
+            self.assertEqual(failed[0][2]["gate"], "margin_impact")
+            self.assertIn("YOUR ORDER IS NOT ACCEPTED",
+                          failed[0][2]["reason"])
+            self.assertEqual(gw.transmit_specs, [])
+
+    def test_concrete_quiet_whatif_still_would_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kubera = FakeKubera()
+            gw = FakeGatewayCC(whatif_reply={
+                "ok": True, "init_margin_change": -120.0,
+                "maint_margin_change": -60.0,
+                "equity_with_loan_change": 0.0, "commission": None,
+                "late_error": None, "late_error_code": None})
+            make_executor(tmp, kubera, gw).cycle()
+            would = events_of(kubera, "would_place")
+            self.assertEqual(len(would), 1)
+            self.assertNotIn("simulate_gate_failed", would[0][2])
+            self.assertEqual(gw.transmit_specs, [])
+
+
 class CcLiveFillTests(unittest.TestCase):
     def _place_live(self, tmp):
         kubera, gw = FakeKubera(), FakeGatewayCC()
@@ -628,6 +765,107 @@ class GatewayContractDetailsTests(unittest.TestCase):
             gw, _ = self._gateway(tmp, mode="silent")
             self.assertIsNone(
                 gw.fetch_contract_details(CC_CON_ID, timeout=0.2))
+
+
+def _whatif_state(init="150.25", maint="75.0", ewl="0.0", comm="1.30"):
+    return SimpleNamespace(status="PreSubmitted",
+                           initMarginChange=init, maintMarginChange=maint,
+                           equityWithLoanChange=ewl, commission=comm)
+
+
+class StubWhatifClient:
+    """EClient double for whatif_cc: answers placeOrder through
+    the real wrapper with a scripted what-if state, optionally
+    firing a trailing error on a timer (tied to the placed order
+    id, or to a different id)."""
+
+    def __init__(self, wrapper, state=None, late=None):
+        self.wrapper = wrapper
+        self.state = state if state is not None else _whatif_state()
+        # late = (delay_seconds, "same"|"other", code, message)
+        self.late = late
+        self.placed = []
+
+    def placeOrder(self, order_id, contract, order):
+        self.placed.append(order_id)
+        self.wrapper.openOrder(order_id, contract, order, self.state)
+        if self.late is not None:
+            delay, which, code, message = self.late
+            target = order_id if which == "same" else order_id + 999
+            timer = threading.Timer(
+                delay, lambda: self.wrapper.error(target, code,
+                                                  message, ""))
+            timer.daemon = True
+            timer.start()
+
+
+class GatewayCcWhatifTests(unittest.TestCase):
+    """whatif_cc (v0.4.1) against the real wrapper: the trailing
+    grace captures a refusal tied to the what-if order id — and
+    only that id."""
+
+    def _gateway(self, tmp, client):
+        gw = setu_exec.ExecGateway(make_cfg(tmp))
+        gw.client = client(gw.wrapper)
+        return gw
+
+    def _spec(self):
+        return setu_exec.build_cc_order_spec(CC_ROW, 6.00, what_if=True)
+
+    def test_quiet_grace_concrete_figures_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = self._gateway(tmp, lambda w: StubWhatifClient(w))
+            start = time.monotonic()
+            reply = gw.whatif_cc(self._spec(), grace=0.3)
+            elapsed = time.monotonic() - start
+            self.assertTrue(reply["ok"])
+            self.assertEqual(reply["init_margin_change"], 150.25)
+            self.assertIsNone(reply["late_error"])
+            # The grace window was actually held.
+            self.assertGreaterEqual(elapsed, 0.25)
+
+    def test_tied_201_inside_grace_is_captured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            late = (0.2, "same", 201,
+                    "YOUR ORDER IS NOT ACCEPTED. IN ORDER TO OBTAIN "
+                    "THE DESIRED POSITION YOUR EQUITY WITH LOAN VALUE "
+                    "[546819.78 USD] MUST EXCEED THE INITIAL MARGIN "
+                    "[559501.74 USD]")
+            gw = self._gateway(
+                tmp, lambda w: StubWhatifClient(w, late=late))
+            reply = gw.whatif_cc(self._spec(), grace=2.0)
+            self.assertTrue(reply["ok"])  # the reply itself landed
+            self.assertEqual(reply["late_error_code"], 201)
+            self.assertIn("YOUR ORDER IS NOT ACCEPTED",
+                          reply["late_error"])
+            self.assertIn("559501.74", reply["late_error"])
+
+    def test_other_order_201_does_not_affect_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            late = (0.2, "other", 201, "YOUR ORDER IS NOT ACCEPTED.")
+            gw = self._gateway(
+                tmp, lambda w: StubWhatifClient(w, late=late))
+            reply = gw.whatif_cc(self._spec(), grace=0.8)
+            self.assertTrue(reply["ok"])
+            self.assertEqual(reply["init_margin_change"], 150.25)
+            self.assertIsNone(reply["late_error"])
+
+    def test_blank_figures_come_back_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blank = _whatif_state(init="", maint="", ewl="", comm="")
+            gw = self._gateway(
+                tmp, lambda w: StubWhatifClient(w, state=blank))
+            reply = gw.whatif_cc(self._spec(), grace=0.2)
+            self.assertTrue(reply["ok"])
+            self.assertIsNone(reply["init_margin_change"])
+
+    def test_whatif_cc_refuses_a_non_whatif_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = self._gateway(tmp, lambda w: StubWhatifClient(w))
+            spec = setu_exec.build_cc_order_spec(CC_ROW, 6.00,
+                                                 what_if=False)
+            with self.assertRaises(AssertionError):
+                gw.whatif_cc(spec, grace=0.1)
 
 
 if __name__ == "__main__":

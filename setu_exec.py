@@ -87,6 +87,33 @@ v0.4.0 (2026-10-26): a second placement kind — covered-call opens
     the row WORKING with the filled qty reported in the detail;
     a complete fill posts "filled" with the average fill price.
 
+v0.4.1 (2026-10-26): a cc_open what-if must be CONCLUSIVE —
+  fail closed (cc_open only; the gtc_close what-if path is
+  untouched).
+  * Observed live in the v0.4.0 rehearsal (2026-10-26): Row A's
+    what-if returned ok with NULL margin figures, so the margin
+    gate passed it — and immediately afterwards the Gateway
+    emitted an asynchronous IB error 201 for that order: "YOUR
+    ORDER IS NOT ACCEPTED. IN ORDER TO OBTAIN THE DESIRED
+    POSITION YOUR EQUITY WITH LOAN VALUE [546819.78 USD] MUST
+    EXCEED THE INITIAL MARGIN [559501.74 USD]". So for cc_open a
+    what-if that yields no margin figures can mean the broker
+    refused to price the hypothetical; v0.4.0 read it as a pass,
+    and live the order would have transmitted and bounced as
+    REJECTED.
+  * Conclusive what-if required: if the cc what-if completes
+    without a concrete initial-margin figure, the row refuses
+    as whatif_inconclusive with the observed figures (or their
+    absence) in the reason. Never transmit on an inconclusive
+    what-if.
+  * Trailing-rejection grace: the Gateway's whatif_cc keeps
+    the what-if's pending slot registered for 3 seconds after
+    the reply lands, so an error tied to that what-if order id
+    (notably 201) is captured instead of escaping. A tied error
+    inside the grace flips the verdict to margin_impact with
+    the broker's message verbatim in the reason. An error tied
+    to any other order id affects nothing.
+
 v0.3.4 (2026-10-25): IB error 202 is a cancellation CONFIRMATION,
   not a failure.
   * v0.3.3's first live bound-order cancel actually landed: on
@@ -254,10 +281,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
+CC_WHATIF_GRACE_SECONDS = 3.0  # v0.4.1: trailing-rejection window after a cc what-if
 RUNAWAY_MIN_SPACING_SECONDS = 60.0   # min gap between live transmissions
 RUNAWAY_DAILY_CAP = 25               # max live placements per London day
 TERMINAL_STATUSES = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
@@ -766,6 +794,46 @@ def gate_cc_price(row: dict, min_tick: float | None) -> tuple[bool, dict]:
     limit = tick_round_to(target, min_tick)
     return True, {"limit": limit, "target_limit": target,
                   "limit_rounded": abs(limit - target) > 1e-9}
+
+
+def gate_cc_whatif(reply: dict | None) -> tuple[bool, dict]:
+    """cc_open what-if verdict (v0.4.1): the preview must be
+    CONCLUSIVE, not merely non-failing. A what-if that succeeds
+    with no concrete initial-margin figure is refused as
+    whatif_inconclusive — observed live (2026-10-26) that shape
+    can mean the broker refused to price the hypothetical, with
+    the refusal (IB error 201) arriving asynchronously a moment
+    later; whatif_cc's trailing grace captures that error tied
+    to the what-if order id and carries it here as late_error,
+    which refuses as margin_impact with the broker's message
+    verbatim. Only a concrete figure inside the shared +$50
+    tolerance passes."""
+    if not reply or not reply.get("ok"):
+        return False, {"gate": "margin_impact",
+                       "reason": f"what-if failed: "
+                                 f"{(reply or {}).get('error') or 'no reply'}"}
+    late = reply.get("late_error")
+    if late:
+        return False, {"gate": "margin_impact", "reason": str(late)}
+    change = to_float(reply.get("init_margin_change"))
+    if change is None:
+        return False, {"gate": "whatif_inconclusive",
+                       "reason": f"what-if returned no initial-margin "
+                                 f"figure (init_margin_change=None, "
+                                 f"maint_margin_change="
+                                 f"{reply.get('maint_margin_change')!r}, "
+                                 f"equity_with_loan_change="
+                                 f"{reply.get('equity_with_loan_change')!r}, "
+                                 f"commission={reply.get('commission')!r}); "
+                                 f"an inconclusive what-if can mean the "
+                                 f"broker refused to price the order — "
+                                 f"refusing to transmit"}
+    if change > WHATIF_MARGIN_TOLERANCE:
+        return False, {"gate": "margin_impact",
+                       "reason": f"what-if init margin change {change} "
+                                 f"exceeds +{WHATIF_MARGIN_TOLERANCE} "
+                                 f"tolerance"}
+    return True, {"whatif": reply}
 
 
 def build_cc_order_spec(row: dict, limit: float, what_if: bool,
@@ -1830,6 +1898,58 @@ class ExecGateway:
             "commission": to_float(getattr(state, "commission", "")),
         }
 
+    def whatif_cc(self, spec: dict,
+                  grace: float = CC_WHATIF_GRACE_SECONDS) -> dict:
+        """cc_open what-if (v0.4.1): like whatif(), but the slot
+        stays registered for a trailing grace window after the
+        reply lands, so an asynchronous broker refusal tied to
+        THIS what-if order id (the error-201 pattern observed
+        live 2026-10-26) is captured as late_error instead of
+        escaping into the untied log path once the slot is gone.
+        The wrapper keys errors by order id, so an error naming
+        any other order can never land in this slot. Only the
+        cc_open path uses this method; whatif() is unchanged."""
+        contract, order = self._ib_objects(spec)
+        if not order.whatIf:
+            raise AssertionError(
+                "whatif_cc() refuses an order without whatIf=True")
+        order_id = self._next_order_id()
+        slot = {"event": threading.Event(), "order_state": None,
+                "status": "", "perm_id": 0, "error": None,
+                "error_code": None}
+        self.pending[order_id] = slot
+        try:
+            self.client.placeOrder(order_id, contract, order)
+            slot["event"].wait(timeout=12.0)
+            if slot["order_state"] is not None and not slot["error"]:
+                # Trailing-rejection grace: hold the slot so a
+                # late error tied to this order id records here.
+                deadline = time.monotonic() + max(0.0, float(grace))
+                while (time.monotonic() < deadline
+                       and not slot["error"]):
+                    time.sleep(0.05)
+        finally:
+            self.pending.pop(order_id, None)
+        state = slot["order_state"]
+        if slot["error"] and state is None:
+            return {"ok": False, "error": slot["error"],
+                    "error_code": slot["error_code"]}
+        if state is None:
+            return {"ok": False,
+                    "error": "no what-if reply from the Gateway"}
+        return {
+            "ok": True,
+            "init_margin_change": to_float(
+                getattr(state, "initMarginChange", "")),
+            "maint_margin_change": to_float(
+                getattr(state, "maintMarginChange", "")),
+            "equity_with_loan_change": to_float(
+                getattr(state, "equityWithLoanChange", "")),
+            "commission": to_float(getattr(state, "commission", "")),
+            "late_error": slot["error"],
+            "late_error_code": slot["error_code"],
+        }
+
     def transmit(self, spec: dict) -> dict:
         """Live placement. Only reachable in live mode with the enable
         file present (the Executor checks before calling); the order
@@ -2639,14 +2759,15 @@ class Executor:
         preview = build_cc_order_spec(row, limit, what_if=True,
                                       multiplier=mult)
         try:
-            reply = self.gateway.whatif(preview)
+            # v0.4.1: the cc what-if must be CONCLUSIVE — whatif_cc
+            # holds a trailing grace for a tied broker refusal, and
+            # gate_cc_whatif refuses a figure-less reply outright.
+            reply = self.gateway.whatif_cc(preview)
         except Exception as exc:
             reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        ok, wdetail = gate_whatif(reply)
+        ok, wdetail = gate_cc_whatif(reply)
         if not ok:
-            self._report_cc_gate_failure(
-                row, {"gate": "margin_impact", "reason": wdetail["reason"]},
-                line)
+            self._report_cc_gate_failure(row, wdetail, line)
             return
 
         if self.mode == "simulate":
