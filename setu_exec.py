@@ -60,6 +60,33 @@ account):
     transient what-if timeout refused a row before live ever
     saw it. Live gate_failed behaviour is unchanged.
 
+v0.4.0 (2026-10-26): a second placement kind — covered-call opens
+  (kind="cc_open"; rows without a kind are gtc_close, handled
+  exactly as before, and rows with any other unknown kind are
+  ignored silently: never errored, never evented).
+  * A cc_open row is a resting SELL-TO-OPEN call on shares the
+    account owns: LMT at the row's target_limit (the limit IS the
+    order price — no premium, no 0.40 derivation anywhere in this
+    path), GTC, regular hours, SMART/USD, orderRef = row id. At
+    most one live order per row, ever; unknown outcomes reconcile
+    by orderRef exactly as placements do.
+  * Gates, in order: reads complete -> approval_mode must not be
+    "bypass" (cc_open is manual-approval only in v1; a
+    bypass-stamped row is refused, never acted on) -> contract
+    verified (reqContractDetails for the row's con_id returns
+    exactly one contract matching symbol / expiry / strike /
+    right C) -> cover (long shares must cover (row qty + working
+    sell-call orders + short call positions on the underlying)
+    x multiplier) -> no working SELL on the exact con_id ->
+    price sane (target_limit > 0, tick-rounded on the verified
+    contract's minTick, the rounding posted in the event detail)
+    -> what-if succeeds and initial margin does not rise by more
+    than the same +$50 tolerance as placements. Then the shared
+    runaway brake and the frozen shape, exactly as placements.
+  * Tracking shares the placement tracker: partial fills keep
+    the row WORKING with the filled qty reported in the detail;
+    a complete fill posts "filled" with the average fill price.
+
 v0.3.4 (2026-10-25): IB error 202 is a cancellation CONFIRMATION,
   not a failure.
   * v0.3.3's first live bound-order cancel actually landed: on
@@ -227,7 +254,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.3.4"
+VERSION = "0.4.0"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -405,6 +432,14 @@ def to_float(value) -> float | None:
 def tick_round(price: float) -> float:
     """Round to the 0.01 option tick (half-up on the cent)."""
     return round(price * 100 + 1e-9) / 100.0
+
+
+def tick_round_to(price: float, tick: float | None) -> float:
+    """Round to an arbitrary tick (a verified contract's minTick);
+    a missing or unusable tick falls back to the 0.01 option tick."""
+    if tick is None or tick <= 0:
+        tick = 0.01
+    return round(round(price / tick + 1e-9) * tick, 10)
 
 
 def london_today() -> str:
@@ -592,6 +627,188 @@ def order_line(row: dict, qty: float, limit: float) -> str:
     strike_s = f"{strike:g}" if isinstance(strike, (int, float)) else str(strike)
     return (f"{row.get('symbol')} {row.get('expiry')} {strike_s}{pc} "
             f"BUY {qty:g} @ {limit:.2f} GTC (row {row.get('id')})")
+
+
+# ---------------------------------------------------------------------------
+# Covered-call open gates (v0.4, unit-tested in tests/test_cc_open_gates.py)
+#
+# A cc_open row is a plain dict: id, con_id, symbol, expiry
+# (YYYY-MM-DD), strike, option_type ("Call"), quantity (positive,
+# contracts to SELL), target_limit (the sell limit itself — there
+# is NO premium and NO 0.40 derivation for this kind).
+# A verified contract is a plain dict from fetch_contract_details:
+# con_id, symbol, expiry (YYYYMMDD), strike, right, multiplier,
+# min_tick.
+# Positions for the cover gate additionally carry sec_type and
+# right (the reader below provides them): the stock position is
+# sec_type "STK", option positions "OPT"/"FOP" with right "C"/"P".
+# ---------------------------------------------------------------------------
+
+def gate_cc_contract(row: dict, details: list[dict] | None) -> tuple[bool, dict]:
+    """The row's con_id must resolve to exactly one live contract
+    whose symbol, expiry, strike and right (C) match the row. A
+    failed details read (None) and an empty reply both refuse as
+    contract_not_found; a wrong or ambiguous contract refuses as
+    contract_mismatch."""
+    con_id = int(row["con_id"])
+    if details is None:
+        return False, {"gate": "contract_not_found",
+                       "reason": f"contract details read failed for con_id {con_id}"}
+    if len(details) == 0:
+        return False, {"gate": "contract_not_found",
+                       "reason": f"no contract found for con_id {con_id}"}
+    if len(details) > 1:
+        return False, {"gate": "contract_mismatch",
+                       "reason": f"con_id {con_id} returned {len(details)} "
+                                 f"contracts, expected exactly one"}
+    d = details[0]
+    problems = []
+    if str(d.get("symbol") or "") != str(row.get("symbol") or ""):
+        problems.append(f"symbol {d.get('symbol')} != row {row.get('symbol')}")
+    if (str(d.get("expiry") or "").replace("-", "")
+            != str(row.get("expiry") or "").replace("-", "")):
+        problems.append(f"expiry {d.get('expiry')} != row {row.get('expiry')}")
+    if abs((to_float(d.get("strike")) or 0.0)
+           - float(row.get("strike") or 0.0)) > 1e-9:
+        problems.append(f"strike {d.get('strike')} != row {row.get('strike')}")
+    if str(d.get("right") or "") != "C":
+        problems.append(f"right {d.get('right')} != C")
+    if problems:
+        return False, {"gate": "contract_mismatch",
+                       "reason": f"con_id {con_id} contract does not match "
+                                 f"the row: " + "; ".join(problems)}
+    return True, {"verified": d}
+
+
+def gate_cc_cover(row: dict, positions: dict | None,
+                  open_orders: list[dict],
+                  multiplier: float) -> tuple[bool, dict]:
+    """Cover: the long stock position in the underlying must cover
+    every contract that would be short if this row filled —
+    (row qty + working sell-call orders on the underlying + short
+    call positions on the underlying) x multiplier <= long shares.
+    Shares already committed to other resting or open short calls
+    are not free to cover a new one."""
+    symbol = str(row.get("symbol") or "")
+    mult = float(multiplier or 100.0)
+    long_shares = 0.0
+    short_calls = 0.0
+    for p in (positions or {}).values():
+        if str(p.get("symbol") or "") != symbol:
+            continue
+        qty = to_float(p.get("quantity")) or 0.0
+        if str(p.get("sec_type") or "") == "STK" and qty > 0:
+            long_shares += qty
+        elif (str(p.get("sec_type") or "") in ("OPT", "FOP")
+                and str(p.get("right") or "") == "C" and qty < 0):
+            short_calls += -qty
+    resting = 0.0
+    for o in open_orders or []:
+        if str(o.get("symbol") or "") != symbol:
+            continue
+        if str(o.get("action") or "") != "SELL":
+            continue
+        if str(o.get("right") or "") != "C":
+            continue
+        if str(o.get("status") or "") in TERMINAL_STATUSES:
+            continue
+        qty = to_float(o.get("remaining"))
+        if qty is None:
+            qty = to_float(o.get("total_quantity"))
+        resting += qty or 0.0
+    new_qty = float(row["quantity"])
+    total_contracts = new_qty + resting + short_calls
+    required = total_contracts * mult
+    detail = {"long_shares": long_shares,
+              "resting_sell_calls": resting,
+              "short_call_positions": short_calls,
+              "multiplier": mult,
+              "required_shares": required}
+    if required > long_shares:
+        return False, {"gate": "insufficient_cover",
+                       "reason": f"{total_contracts:g} contracts x {mult:g} = "
+                                 f"{required:g} shares required ({new_qty:g} new "
+                                 f"+ {resting:g} resting sell calls + "
+                                 f"{short_calls:g} short call positions) but "
+                                 f"only {long_shares:g} long {symbol} shares",
+                       **detail}
+    return True, detail
+
+
+def gate_cc_duplicate(row: dict, open_orders: list[dict]) -> tuple[bool, dict]:
+    """Never a second working SELL on the exact con_id, at any
+    price, and never anything carrying this row's orderRef."""
+    ref = str(row["id"])
+    for o in open_orders or []:
+        if str(o.get("order_ref") or "") == ref:
+            return False, {"gate": "duplicate_open_order",
+                           "reason": f"an open order already carries orderRef {ref}"}
+        if (int(o.get("con_id") or 0) == int(row["con_id"])
+                and str(o.get("action") or "") == "SELL"
+                and str(o.get("status") or "") not in TERMINAL_STATUSES):
+            return False, {"gate": "duplicate_open_order",
+                           "reason": f"working SELL on con_id {row['con_id']} "
+                                     f"already exists at {o.get('limit_price')}; "
+                                     f"a second resting covered call on the "
+                                     f"same contract is a human decision"}
+    return True, {}
+
+
+def gate_cc_price(row: dict, min_tick: float | None) -> tuple[bool, dict]:
+    """The limit IS the order price: it must be positive, and it is
+    tick-rounded on the verified contract's minTick. A rounding
+    change is carried in the detail so the caller posts it."""
+    target = to_float(row.get("target_limit"))
+    if target is None or target <= 0:
+        return False, {"gate": "price",
+                       "reason": f"target_limit {row.get('target_limit')} is "
+                                 f"not a usable sell limit (must be > 0)"}
+    limit = tick_round_to(target, min_tick)
+    return True, {"limit": limit, "target_limit": target,
+                  "limit_rounded": abs(limit - target) > 1e-9}
+
+
+def build_cc_order_spec(row: dict, limit: float, what_if: bool,
+                        multiplier: float = 100.0) -> dict:
+    """The frozen cc_open shape — the ONLY sell this program can
+    build: SELL / LMT / GTC / regular hours / single OPT call leg,
+    SMART/USD, orderRef = staged row id. `what_if` is the single
+    field that differs between the simulate preview and the live
+    transmit."""
+    expiry = str(row.get("expiry") or "").replace("-", "")
+    mult = float(multiplier or 100.0)
+    mult_s = str(int(mult)) if mult.is_integer() else str(mult)
+    return {
+        "contract": {
+            "conId": int(row["con_id"]),
+            "symbol": str(row.get("symbol") or ""),
+            "secType": "OPT",
+            "exchange": "SMART",
+            "currency": "USD",
+            "lastTradeDateOrContractMonth": expiry,
+            "strike": float(row.get("strike") or 0.0),
+            "right": "C",
+            "multiplier": mult_s,
+        },
+        "order": {
+            "action": "SELL",
+            "orderType": "LMT",
+            "totalQuantity": float(row["quantity"]),
+            "lmtPrice": float(limit),
+            "tif": "GTC",
+            "outsideRth": False,
+            "orderRef": str(row["id"]),
+            "whatIf": bool(what_if),
+            "transmit": True,
+        },
+    }
+
+
+def cc_line(row: dict, qty: float, limit: float) -> str:
+    strike = row.get("strike")
+    strike_s = f"{strike:g}" if isinstance(strike, (int, float)) else str(strike)
+    return (f"{row.get('symbol')} {row.get('expiry')} {strike_s}C "
+            f"SELL TO OPEN {qty:g} @ {limit:.2f} GTC (row {row.get('id')})")
 
 
 # ---------------------------------------------------------------------------
@@ -1089,6 +1306,10 @@ def normalise_row(raw: dict) -> dict:
         "reason": str(raw.get("reason") or ""),
         "source": str(raw.get("source") or ""),
         "approval_mode": str(raw.get("approval_mode") or ""),
+        # v0.4: placement kind. Absent (every pre-v0.4 row) = ""
+        # which the cycle treats as "gtc_close"; "cc_open" is the
+        # covered-call open; any other value is ignored silently.
+        "kind": str(raw.get("kind") or "").strip().lower(),
     }
 
 
@@ -1161,9 +1382,16 @@ class ExecGateway:
         self.open_orders: list[dict] = []
         self.status_by_key: dict = {}
         self.fill_by_key: dict = {}  # key -> (filled, remaining), v0.3
+        self.fill_price_by_key: dict = {}  # key -> avg fill price, v0.4
         self.last_status_by_perm: dict[int, str] = {}
+        self.last_fill_by_perm: dict[int, dict] = {}
         self.open_orders_event = threading.Event()
         self.next_id = 0
+        # reqId -> slot for reqContractDetails (v0.4). Request ids
+        # come from a high private sequence so they can never
+        # collide with order ids (which the Gateway assigns).
+        self.contract_reqs: dict[int, dict] = {}
+        self._req_seq = 800000
         # orderId -> {"event": Event, "order_state": OrderState|None,
         #             "status": str, "perm_id": int, "error": str|None,
         #             "error_code": int|None}
@@ -1190,6 +1418,8 @@ class ExecGateway:
                 outer.positions[con_id] = {
                     "con_id": con_id,
                     "symbol": str(getattr(contract, "symbol", "") or ""),
+                    "sec_type": str(getattr(contract, "secType", "") or ""),
+                    "right": str(getattr(contract, "right", "") or ""),
                     "quantity": to_float(pos) or 0.0,
                     "avg_cost": avg,
                 }
@@ -1211,6 +1441,7 @@ class ExecGateway:
                     "strike": to_float(getattr(contract, "strike", None)),
                     "right": str(getattr(contract, "right", "") or ""),
                     "action": str(getattr(order, "action", "") or ""),
+                    "total_quantity": to_float(getattr(order, "totalQuantity", None)),
                     "limit_price": lmt if (lmt is not None and lmt < UNSET) else None,
                     "order_ref": str(getattr(order, "orderRef", "") or ""),
                     "status": str(getattr(orderState, "status", "") or ""),
@@ -1235,15 +1466,48 @@ class ExecGateway:
                 key = ("p", int(permId)) if permId else ("i", int(orderId))
                 outer.status_by_key[key] = str(status or "")
                 outer.fill_by_key[key] = (to_float(filled), to_float(remaining))
+                outer.fill_price_by_key[key] = to_float(avgFillPrice)
                 slot = outer.pending.get(int(orderId))
                 if slot is not None:
                     slot["status"] = str(status or "")
+                    slot["avg_fill_price"] = to_float(avgFillPrice)
                     if permId:
                         slot["perm_id"] = int(permId)
                     slot["event"].set()
 
+            def contractDetails(self, reqId, contractDetails):
+                slot = outer.contract_reqs.get(int(reqId))
+                if slot is None:
+                    return
+                c = contractDetails.contract
+                slot["details"].append({
+                    "con_id": int(to_float(getattr(c, "conId", 0)) or 0),
+                    "symbol": str(getattr(c, "symbol", "") or ""),
+                    "sec_type": str(getattr(c, "secType", "") or ""),
+                    "expiry": str(getattr(
+                        c, "lastTradeDateOrContractMonth", "") or ""),
+                    "strike": to_float(getattr(c, "strike", None)),
+                    "right": str(getattr(c, "right", "") or ""),
+                    "multiplier": str(getattr(c, "multiplier", "") or ""),
+                    "min_tick": to_float(getattr(contractDetails, "minTick", None)),
+                })
+
+            def contractDetailsEnd(self, reqId):
+                slot = outer.contract_reqs.get(int(reqId))
+                if slot is not None:
+                    slot["event"].set()
+
             def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
                 if errorCode in BENIGN_ERRORS:
+                    return
+                cslot = (outer.contract_reqs.get(int(reqId))
+                         if isinstance(reqId, int) else None)
+                if cslot is not None:
+                    # A contract-details error completes that
+                    # request with a failure; it is never read
+                    # poison for the positions/orders machinery.
+                    cslot["error"] = f"IB error {errorCode}: {errorString}"
+                    cslot["event"].set()
                     return
                 slot = outer.pending.get(int(reqId)) if isinstance(reqId, int) else None
                 if slot is not None:
@@ -1433,6 +1697,7 @@ class ExecGateway:
         self.open_orders = []
         self.status_by_key = {}
         self.fill_by_key = {}
+        self.fill_price_by_key = {}
         self.read_error = None
         self._reading = True
         self.open_orders_event.clear()
@@ -1446,6 +1711,10 @@ class ExecGateway:
             self._reading = False
         self.last_status_by_perm = {
             int(k[1]): v for k, v in self.status_by_key.items() if k[0] == "p"}
+        self.last_fill_by_perm = {
+            int(k[1]): {"filled": v[0], "remaining": v[1],
+                        "avg_fill_price": self.fill_price_by_key.get(k)}
+            for k, v in self.fill_by_key.items() if k[0] == "p"}
         out = []
         for o in self.open_orders:
             key = o.pop("_key")
@@ -1457,6 +1726,42 @@ class ExecGateway:
             o["remaining"] = remaining
             out.append(o)
         return out
+
+    # -- contract verification (v0.4) --------------------------------------
+    def _alloc_req_id(self) -> int:
+        self._req_seq += 1
+        return self._req_seq
+
+    def fetch_contract_details(self, con_id: int,
+                               timeout: float = 12.0) -> list[dict] | None:
+        """reqContractDetails for one con_id. Returns the detail
+        dicts on a completed read (possibly an empty list), or None
+        when the read failed or timed out — the caller refuses
+        either way, but the reason can tell the two apart. Errors
+        for this request complete its slot (see the wrapper); they
+        never poison the positions/orders reads."""
+        from ibapi.contract import Contract
+        req_id = self._alloc_req_id()
+        slot = {"event": threading.Event(), "details": [], "error": None}
+        self.contract_reqs[req_id] = slot
+        contract = Contract()
+        contract.conId = int(con_id)
+        try:
+            self.client.reqContractDetails(req_id, contract)
+            if not slot["event"].wait(timeout=timeout):
+                log(f"contract details read timed out for con_id {con_id}")
+                return None
+        except Exception as exc:
+            log(f"contract details read failed for con_id {con_id} "
+                f"({type(exc).__name__}: {exc})")
+            return None
+        finally:
+            self.contract_reqs.pop(req_id, None)
+        if slot["error"]:
+            log(f"contract details read failed for con_id {con_id}: "
+                f"{slot['error']}")
+            return None
+        return slot["details"]
 
     # -- order calls ------------------------------------------------------
     def _ib_objects(self, spec: dict):
@@ -1542,7 +1847,8 @@ class ExecGateway:
         finally:
             self.pending.pop(order_id, None)
         return {"order_id": order_id, "perm_id": slot["perm_id"],
-                "status": slot["status"], "error": slot["error"]}
+                "status": slot["status"], "error": slot["error"],
+                "avg_fill_price": slot.get("avg_fill_price")}
 
     def cancel_order(self, order: dict, on_transmit=None) -> dict:
         """Live cancel of an EXISTING order (v0.3) — addressed by a
@@ -1878,9 +2184,19 @@ class Executor:
                     continue  # cancel already transmitted; reconciling
                 self.process_cancel_row(row, positions, open_orders)
                 continue
+            kind = str(row.get("kind") or "gtc_close")
+            if kind not in ("gtc_close", "cc_open"):
+                # A kind this build does not understand (v0.4):
+                # ignore the row silently — never errored, never
+                # evented, so a newer Kubera can stage kinds ahead
+                # of an executor upgrade safely.
+                continue
             if self.tracker.get(row["id"]) is not None:
                 continue  # already placed once; never again
-            self.process_row(row, positions, open_orders)
+            if kind == "cc_open":
+                self.process_cc_row(row, positions, open_orders)
+            else:
+                self.process_row(row, positions, open_orders)
 
     # -- placed-order tracking ---------------------------------------------
     def reconcile(self, open_orders: list[dict]) -> None:
@@ -1892,6 +2208,7 @@ class Executor:
             return
         live_refs = {str(o.get("order_ref") or ""): o for o in open_orders}
         sweep_status = getattr(self.gateway, "last_status_by_perm", {}) or {}
+        sweep_fill = getattr(self.gateway, "last_fill_by_perm", {}) or {}
         for row_id, rec in list(self.tracker.orders.items()):
             live = live_refs.get(str(row_id))
             if live is not None:
@@ -1902,6 +2219,22 @@ class Executor:
                     fields["last_status"] = live["status"]
                 if fields:
                     self.tracker.update(row_id, **fields)
+                    rec = {**rec, **fields}
+                if rec.get("kind") == "cc_open":
+                    # Partial fills (v0.4): the row stays WORKING;
+                    # a newly grown filled qty is reported once,
+                    # with the running average fill price when the
+                    # sweep carries one.
+                    filled = to_float(live.get("filled"))
+                    known = to_float(rec.get("filled_qty")) or 0.0
+                    if filled is not None and filled > known:
+                        self.tracker.update(row_id, filled_qty=filled)
+                        fill = sweep_fill.get(int(live.get("perm_id") or 0), {})
+                        self._report(row_id, "placed", {
+                            "kind": "cc_open",
+                            "filled_qty": filled,
+                            "remaining": to_float(live.get("remaining")),
+                            "avg_fill_price": fill.get("avg_fill_price")})
                 continue
             # Not in open orders: the latest sweep's orderStatus map may
             # have caught a terminal transition for this perm id.
@@ -1912,8 +2245,20 @@ class Executor:
                     rec = {**rec, "last_status": seen}
             status = str(rec.get("last_status") or "")
             if status == "Filled":
-                self._report(row_id, "filled", {"broker_order_id": rec.get("broker_order_id"),
-                                                "perm_id": rec.get("perm_id")})
+                detail = {"broker_order_id": rec.get("broker_order_id"),
+                          "perm_id": rec.get("perm_id")}
+                if rec.get("kind") == "cc_open":
+                    # A complete fill reports the average fill
+                    # price (v0.4): the sweep's fill record for
+                    # this perm when it caught one, else the last
+                    # price the transmit/fill updates stored.
+                    fill = sweep_fill.get(int(rec.get("perm_id") or 0), {})
+                    detail.update({
+                        "kind": "cc_open",
+                        "filled_qty": rec.get("total_qty"),
+                        "avg_fill_price": fill.get("avg_fill_price")
+                        or rec.get("last_avg_fill_price")})
+                self._report(row_id, "filled", detail)
                 self.tracker.drop(row_id)
             elif status in ("Cancelled", "ApiCancelled"):
                 self._report(row_id, "cancelled", {"broker_order_id": rec.get("broker_order_id"),
@@ -2031,6 +2376,29 @@ class Executor:
         self._report(row["id"], "gate_failed", detail)
         self._notify("setu-exec: cancel refused",
                      f"{self.account} cancel {line} — refused at gate "
+                     f"[{detail.get('gate')}]: {detail.get('reason')}")
+
+    def _report_cc_gate_failure(self, row: dict, detail: dict,
+                                line: str) -> None:
+        """cc_open gate verdicts, mode-appropriate exactly like
+        placements (v0.2.1 semantics): simulate failures are NOT
+        terminal (posted as would_place with a simulate_gate_failed
+        detail, returning the row to APPROVED), live failures are
+        gate_failed plus the refusal Pushover."""
+        if self.mode == "simulate":
+            log(f"SIMULATE GATE FAILED [{detail.get('gate')}] {line}"
+                f" — {detail.get('reason')}")
+            self._report(row["id"], "would_place", {
+                "simulate_gate_failed": True,
+                "gate": detail.get("gate"),
+                "reason": detail.get("reason"),
+                "kind": "cc_open"})
+            return
+        log(f"GATE FAILED [{detail.get('gate')}] {line}"
+            f" — {detail.get('reason')}")
+        self._report(row["id"], "gate_failed", detail)
+        self._notify("setu-exec: gate refusal",
+                     f"{self.account} {line} — refused at gate "
                      f"[{detail.get('gate')}]: {detail.get('reason')}")
 
     def _cancel_failed(self, row: dict, line: str, error) -> None:
@@ -2217,6 +2585,146 @@ class Executor:
                      f"{self.account} cancel {line} — Gateway reported "
                      f"cancelled but the order still appears; NOT "
                      f"confirmed, tracked for reconciliation")
+
+    # -- one staged covered-call open row (v0.4) ------------------------------
+    def process_cc_row(self, row: dict, positions: dict[int, dict] | None,
+                       open_orders: list[dict] | None) -> None:
+        line = cc_line(row, row["quantity"], row["target_limit"] or 0)
+        self._report(row["id"], "placing", {"mode": self.mode,
+                                            "kind": "cc_open"})
+        if positions is None or open_orders is None:
+            # Defence in depth, as placements: never gate on
+            # partial data.
+            detail = {"gate": "reads_incomplete",
+                      "reason": "live Gateway reads did not complete; "
+                                "refusing to evaluate gates on partial data"}
+            self._report_cc_gate_failure(row, detail, line)
+            return
+        if str(row.get("approval_mode") or "") == "bypass":
+            # cc_open is manual-approval only in v1: a bypass stamp
+            # is a gate failure, never an instruction to act.
+            detail = {"gate": "cc_bypass_not_supported",
+                      "reason": "cc_open rows are manual-approval only; "
+                                "a bypass-stamped cc_open row is refused, "
+                                "never acted on"}
+            self._report_cc_gate_failure(row, detail, line)
+            return
+        try:
+            details = self.gateway.fetch_contract_details(int(row["con_id"]))
+        except Exception as exc:
+            log(f"contract details raised for con_id {row['con_id']} "
+                f"({type(exc).__name__}: {exc})")
+            details = None
+        ok, detail = gate_cc_contract(row, details)
+        if not ok:
+            self._report_cc_gate_failure(row, detail, line)
+            return
+        verified = detail["verified"]
+        mult = to_float(verified.get("multiplier")) or 100.0
+        ok, detail = gate_cc_cover(row, positions, open_orders, mult)
+        if not ok:
+            self._report_cc_gate_failure(row, detail, line)
+            return
+        ok, detail = gate_cc_duplicate(row, open_orders)
+        if not ok:
+            self._report_cc_gate_failure(row, detail, line)
+            return
+        ok, detail = gate_cc_price(row, to_float(verified.get("min_tick")))
+        if not ok:
+            self._report_cc_gate_failure(row, detail, line)
+            return
+        limit = detail["limit"]
+        line = cc_line(row, row["quantity"], limit)
+
+        preview = build_cc_order_spec(row, limit, what_if=True,
+                                      multiplier=mult)
+        try:
+            reply = self.gateway.whatif(preview)
+        except Exception as exc:
+            reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        ok, wdetail = gate_whatif(reply)
+        if not ok:
+            self._report_cc_gate_failure(
+                row, {"gate": "margin_impact", "reason": wdetail["reason"]},
+                line)
+            return
+
+        if self.mode == "simulate":
+            log(f"WOULD PLACE {line}")
+            out = {"order": preview, "whatif": wdetail["whatif"],
+                   "kind": "cc_open", "limit": limit}
+            if detail["limit_rounded"]:
+                out["limit_rounded_from"] = detail["target_limit"]
+            self._report(row["id"], "would_place", out)
+            return
+
+        # Live: shared runaway brake, deferring exactly like a
+        # placement (the row returns to APPROVED via would_place).
+        brake_ok, brake_reason = self.tracker.brake_check()
+        if not brake_ok:
+            wait = self.tracker.brake_wait_seconds()
+            if wait is not None:
+                log(f"RUNAWAY BRAKE [defer] {line} — {brake_reason}; "
+                    f"retry in ~{wait:.0f}s, row left APPROVED")
+            else:
+                log(f"RUNAWAY BRAKE [defer] {line} — {brake_reason}; "
+                    f"row left APPROVED until the daily count resets")
+            self._report(row["id"], "would_place", {
+                "deferred": True, "gate": "runaway_brake",
+                "reason": brake_reason, "kind": "cc_open"})
+            return
+        spec = build_cc_order_spec(row, limit, what_if=False,
+                                   multiplier=mult)
+        # Record BEFORE transmitting, and count the transmission
+        # before the attempt — the placement discipline exactly:
+        # transmit() always issues its placeOrder, so the brake
+        # counts exactly the real calls, and a crash mid-placement
+        # still leaves the orderRef trace reconcile() resolves.
+        self.tracker.add(row["id"], {
+            "order_ref": str(row["id"]), "account": self.account,
+            "kind": "cc_open",
+            "confirmed": False, "broker_order_id": None, "perm_id": None,
+            "last_status": "",
+            "placed_at": datetime.now(LONDON).isoformat(timespec="seconds"),
+            "order": spec, "filled_qty": 0.0,
+            "total_qty": float(row["quantity"]),
+            "last_avg_fill_price": None})
+        self.tracker.record_transmission()
+        try:
+            result = self.gateway.transmit(spec)
+        except Exception as exc:
+            result = {"order_id": None, "perm_id": 0, "status": "",
+                      "error": f"{type(exc).__name__}: {exc}"}
+        if result.get("error"):
+            log(f"PLACEMENT REJECTED {line} — {result['error']}")
+            self._report(row["id"], "rejected",
+                         {"reason": result["error"], "order": spec,
+                          "kind": "cc_open"})
+            self.tracker.drop(row["id"])
+            return
+        if not result.get("status") and not result.get("perm_id"):
+            log(f"PLACED (unconfirmed) {line} — no Gateway reply yet; "
+                f"tracking by orderRef")
+            self._notify("setu-exec: order placed (unconfirmed)",
+                         f"{self.account} {line} — transmitted, no Gateway "
+                         f"confirmation yet; tracked by orderRef")
+            return
+        self.tracker.update(row["id"], confirmed=True,
+                            broker_order_id=result.get("order_id"),
+                            perm_id=result.get("perm_id") or None,
+                            last_status=result.get("status") or "",
+                            last_avg_fill_price=result.get("avg_fill_price"))
+        log(f"PLACED {line} — order {result.get('order_id')} "
+            f"perm {result.get('perm_id')}")
+        out = {"broker_order_id": result.get("order_id"),
+               "perm_id": result.get("perm_id"), "order": spec,
+               "kind": "cc_open"}
+        if detail["limit_rounded"]:
+            out["limit_rounded_from"] = detail["target_limit"]
+        self._report(row["id"], "placed", out)
+        self._notify("setu-exec: order placed",
+                     f"{self.account} {line} — PLACED order "
+                     f"{result.get('order_id')} perm {result.get('perm_id')}")
 
     # -- one staged row -------------------------------------------------------
     def process_row(self, row: dict, positions: dict[int, dict] | None,

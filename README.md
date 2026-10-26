@@ -198,6 +198,49 @@ the agreed bar, Kubera may stamp scanner rows
 `approval_mode: "bypass"` and approve them without a human wait. The
 executor treats those rows identically; every gate still applies.
 
+### Covered-call opens (setu-exec v0.4.0)
+
+Staged rows may carry `kind: "cc_open"` — the mirror flow for the
+covered-call spike harvest. A cc_open row is a resting SELL-TO-OPEN
+call on shares the account owns, staged by Molang and approved by
+Zonito in the panel like every other row. Rows without a `kind` are
+`gtc_close` and are handled exactly as before; rows with any other
+unknown kind are ignored silently (never errored, never evented), so
+Kubera can stage new kinds ahead of an executor upgrade.
+
+The row carries `target_limit` as the sell limit itself — **the
+limit IS the order price**. There is no premium and no 0.40
+derivation anywhere in this path; any code that recomputes a target
+from a premium applies only to gtc_close rows. The frozen shape is
+SELL / LMT / GTC / regular hours / single call leg, SMART/USD,
+`orderRef` = the staged row id, at most one live order per row ever.
+
+**cc_open gates, in order:** armed + kill switch off (shared, fail
+closed) → fresh complete live reads → contract verified
+(`reqContractDetails` for the row's con_id returns exactly one
+contract matching symbol, expiry, strike and right C; otherwise
+`contract_not_found` / `contract_mismatch`) → cover (long shares
+must cover (row qty + working sell-call orders on the underlying +
+short call positions on the underlying) × multiplier; shares
+committed to other resting or open short calls are not free, and a
+shortfall refuses as `insufficient_cover` with the numbers in the
+reason) → no working SELL on the exact con_id
+(`duplicate_open_order`, any price) → price sane (limit > 0,
+tick-rounded on the verified contract's minTick; a rounding change
+is posted in the event detail) → what-if succeeds and initial
+margin does not rise by more than +$50 (`margin_impact`). Then the
+shared runaway brake and the transmit, exactly as placements.
+
+**Approval is manual only in v1:** if a cc_open row ever arrives
+stamped `approval_mode: "bypass"` the executor refuses it
+(`cc_bypass_not_supported`) rather than acting on it.
+
+Tracking shares the placement tracker and its orderRef
+reconciliation: partial fills keep the row WORKING with the filled
+qty reported, and a complete fill posts `filled` with the average
+fill price. A filled cc_open short call then enters the ordinary
+gtc_close coverage loop like any other short.
+
 ## Config — `~/.setu/config.json`
 
 | Key | Meaning |
