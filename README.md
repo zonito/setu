@@ -323,6 +323,78 @@ parent, a call wing above), and its expiry is on or after the
 parent's. A violation refuses `wing_rule_violation` naming the
 rule.
 
+### Sell shares, share-parent wings, sentinel cc_open (setu-exec v0.6.0)
+
+Three additions, staged from the Kubera P3 share-row actions. All
+three are **manual-approval only** (a bypass-stamped row refuses,
+never acts), and every existing kind is behaviour-identical.
+
+**`sell_shares`** — sell stock at a limit, staged from a share
+row's Sell action. The row carries the stock's real `con_id`
+(required — no sentinel for something the account holds), the
+quantity **in shares**, and `target_limit` as the sell limit.
+Frozen shape: SELL / LMT / **GTC only** (anything else refuses
+`bad_tif`) / regular hours / single STK leg, SMART/USD,
+`orderRef` = the row id.
+
+Gates, in order: armed + kill switch off → fresh complete live
+reads → TIF is GTC → contract verified (the con_id resolves to
+exactly one STK contract whose symbol matches;
+`contract_not_found` / `contract_mismatch`) → position (long
+shares; zero refuses `position_missing`, a smaller holding sells
+what exists and flags `reduced`, exactly like close_now) →
+**oversell guard** (the shares already committed to working SELL
+orders on the same stock, plus this placement, must not exceed
+the long position — two staged sells that each fit alone must
+never fit together past the holding; refuses `oversell` with the
+numbers) → price sane (limit > 0, tick-rounded on the verified
+stock contract) → the standard what-if gate → the shared runaway
+brake → transmit, tracked and reconciled exactly as placements.
+
+**`wing_open` with `parent_kind="shares"`** — hedge puts against
+a share position, staged from a share row's Hedge action. The
+row's `parent_con_id` is the **stock's** con_id and
+`parent_quantity` the shares held at staging; there is no parent
+strike, expiry or type. The wing leg is the ordinary wing leg
+(its `con_id` may be the 0 sentinel). Frozen shape: the wing
+shape — BUY / LMT / GTC / single OPT leg, SMART/USD, built from
+the verified wing contract.
+
+Gates, in order: armed + kill switch off → fresh complete live
+reads → **wing identity first** (verified or resolved exactly as
+option-parent wings resolve — the parent check needs the
+resolved contract's multiplier) → parent real (long shares in
+`parent_con_id` ≥ wing contracts × the resolved multiplier;
+`parent_position_missing` / `parent_qty_insufficient` with the
+numbers) → the share-hedge wing rules → duplicate (any working
+BUY on the resolved wing contract) → price sane → the standard
+what-if gate → the shared runaway brake → transmit, tracked as
+placements.
+
+The share-hedge wing rules replace the option-parent ones: the
+wing must be a **put** (a hedge against long shares buys
+downside protection, never a call), and its strike must sit
+**below the parent stock's current market price** — a strike at
+or above spot is a different trade than the one staged. To make
+that check possible, the positions read now also carries each
+position's current market price (the `updatePortfolio` snapshot
+merged into the same fresh read; additive — no other gate reads
+it). A read that carried no price for the parent cannot prove
+the rule, so it refuses `wing_rule_violation` rather than
+guessing a spot.
+
+**`cc_open` with `con_id` 0** — the Shares-UI CC action stages a
+not-yet-held call with the same unresolved sentinel the wing
+legs use (Molang-staged rows keep real con_ids and never touch
+this path). The executor resolves the sentinel **by spec**
+(symbol / expiry / strike / right C) before anything else in the
+cc pipeline: zero exact matches refuses `contract_not_found`,
+more than one distinct con_id refuses `contract_mismatch`, and
+exactly one proceeds through the **existing** cc pipeline —
+contract verification, cover, duplicate, the conclusive what-if
+— with the resolved id, which the placed / would_place event
+detail carries as `resolved_con_id`.
+
 ## Config — `~/.setu/config.json`
 
 | Key | Meaning |

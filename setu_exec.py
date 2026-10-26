@@ -158,6 +158,56 @@ v0.5.0 (2026-10-26): two more placement kinds, staged from the
     contract) -> the standard what-if gate. Then the shared
     brake and transmit, tracked as placements.
 
+v0.6.0 (2026-10-26): three additions, all in the established
+  patterns and all manual-approval only (a bypass-stamped row
+  of any of them refuses, never acts). Existing kinds are
+  behaviour-identical.
+  * sell_shares (staged from the Kubera P3 share-row Sell
+    action): SELL / STK / LMT at the row's target_limit,
+    tick-rounded on the verified stock contract / GTC only
+    (anything else refuses bad_tif) / regular hours /
+    SMART/USD / orderRef = row id; the quantity is in SHARES.
+    Gates: reads complete -> contract verified (the row's
+    con_id must resolve to exactly one STK contract whose
+    symbol matches) -> position (long shares; zero refuses
+    position_missing, a smaller holding sells what exists,
+    flagged reduced exactly like close_now) -> oversell guard
+    (working SELL orders on the same stock plus this
+    placement must not exceed the long shares; refuses
+    oversell with the numbers) -> price sane -> the STANDARD
+    what-if gate. Then the shared brake and transmit.
+  * wing_open with parent_kind="shares" (the P3 Hedge
+    action): hedge puts against a share position. The row's
+    parent_con_id is the STOCK's con_id and parent_quantity
+    the shares held at staging; there is no parent strike,
+    expiry or type. The wing leg is resolved/verified FIRST
+    (the v0.5 machinery, unchanged), then the parent check:
+    long shares >= wing contracts x the resolved contract's
+    multiplier (parent_position_missing /
+    parent_qty_insufficient with the numbers). Wing rules
+    for a shares parent: the wing must be a Put, and its
+    strike must sit below the parent stock's CURRENT market
+    price — so the positions read now also carries each
+    position's market price (updatePortfolio merged into the
+    fresh read, additive; every other gate is unaffected).
+    A strike at or above spot, or a spot the read did not
+    carry, refuses wing_rule_violation naming strike vs
+    spot. Then duplicate / price / the standard what-if,
+    and the BUY/LMT/GTC wing shape exactly as option wings.
+  * cc_open with con_id 0: Kubera's Shares-UI staging stores
+    the same unresolved sentinel for a not-yet-held call
+    that wing legs use (Molang-staged rows keep real
+    con_ids). The executor resolves the sentinel by spec
+    (symbol / expiry / strike / right C) before anything
+    else in the cc pipeline: zero exact matches refuses
+    contract_not_found, more than one distinct con_id
+    refuses contract_mismatch, and exactly one proceeds
+    through the EXISTING pipeline (contract verification,
+    cover, duplicate, conclusive what-if) with the resolved
+    id, which the placed/would_place event detail carries
+    as resolved_con_id. A row with a real con_id never
+    touches the by-spec resolver.
+
 v0.3.4 (2026-10-25): IB error 202 is a cancellation CONFIRMATION,
   not a failure.
   * v0.3.3's first live bound-order cancel actually landed: on
@@ -325,7 +375,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -1301,6 +1351,284 @@ def wing_line(row: dict, qty: float, limit: float, wing_con_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# sell_shares / share-parent wing / cc sentinel gates (v0.6,
+# unit-tested in tests/test_v060_gates.py)
+#
+# A sell_shares row is a plain dict: id, con_id (the STOCK's real
+# con_id — required, never a sentinel), symbol, sec_type "STK",
+# quantity (positive, in SHARES), target_limit (the sell limit),
+# tif ("GTC" — fixed for this kind).
+# A share-parent wing row is a wing_open row with
+# parent_kind="shares": parent_con_id is the STOCK's con_id,
+# parent_quantity the shares held at staging, and there is no
+# parent strike / expiry / option_type. Its wing leg fields are
+# the ordinary wing ones (con_id may be 0).
+# ---------------------------------------------------------------------------
+
+def gate_sell_tif(row: dict) -> tuple[bool, dict]:
+    """sell_shares rests GTC or it does not rest at all: the kind
+    has exactly one time-in-force, and anything else (DAY
+    included) is a row this system did not stage."""
+    tif = str(row.get("tif") or "").strip().upper()
+    if tif != "GTC":
+        return False, {"gate": "bad_tif",
+                       "reason": f"tif {row.get('tif')!r} is not GTC; "
+                                 f"sell_shares rows rest GTC only"}
+    return True, {"tif": tif}
+
+
+def gate_sell_contract(row: dict, details: list[dict] | None) -> tuple[bool, dict]:
+    """The row's con_id must resolve to exactly one live contract
+    that is the STOCK itself: sec_type STK and the row's symbol.
+    A failed read and an empty reply refuse contract_not_found;
+    a wrong or ambiguous contract refuses contract_mismatch."""
+    con_id = int(row["con_id"])
+    if details is None:
+        return False, {"gate": "contract_not_found",
+                       "reason": f"contract details read failed for "
+                                 f"con_id {con_id}"}
+    if len(details) == 0:
+        return False, {"gate": "contract_not_found",
+                       "reason": f"no contract found for con_id {con_id}"}
+    if len(details) > 1:
+        return False, {"gate": "contract_mismatch",
+                       "reason": f"con_id {con_id} returned "
+                                 f"{len(details)} contracts, expected "
+                                 f"exactly one"}
+    d = details[0]
+    problems = []
+    if str(d.get("sec_type") or "") != "STK":
+        problems.append(f"sec_type {d.get('sec_type')} != STK")
+    if str(d.get("symbol") or "") != str(row.get("symbol") or ""):
+        problems.append(f"symbol {d.get('symbol')} != row "
+                        f"{row.get('symbol')}")
+    if problems:
+        return False, {"gate": "contract_mismatch",
+                       "reason": f"con_id {con_id} contract does not "
+                                 f"match the row: " + "; ".join(problems)}
+    return True, {"verified": d}
+
+
+def gate_sell_position(row: dict, position: dict | None,
+                       open_orders: list[dict]) -> tuple[bool, dict]:
+    """The shares must be there and long. Zero (or a non-long
+    position) refuses position_missing; a smaller holding sells
+    what exists, flagged reduced exactly like close_now. Then
+    the oversell guard: the shares already committed to working
+    SELL orders on this stock plus this placement must not
+    exceed the long position — two staged sells that each fit
+    alone must never fit together past the holding."""
+    con_id = int(row["con_id"])
+    if position is None:
+        return False, {"gate": "position_missing",
+                       "reason": f"no live position for stock con_id "
+                                 f"{con_id}; nothing to sell"}
+    long_qty = to_float(position.get("quantity")) or 0.0
+    if long_qty <= 0:
+        return False, {"gate": "position_missing",
+                       "reason": f"position for stock con_id {con_id} "
+                                 f"is not long (qty {long_qty}); "
+                                 f"nothing to sell"}
+    effective = min(float(row["quantity"]), long_qty)
+    if effective <= 0:
+        return False, {"gate": "position_missing",
+                       "reason": f"nothing to sell for stock con_id "
+                                 f"{con_id}"}
+    ref = str(row["id"])
+    working_sells = 0.0
+    for o in open_orders or []:
+        if int(o.get("con_id") or 0) != con_id:
+            continue
+        if str(o.get("action") or "") != "SELL":
+            continue
+        if str(o.get("status") or "") in TERMINAL_STATUSES:
+            continue
+        if str(o.get("order_ref") or "") == ref:
+            continue  # this row's own earlier placement, tracked
+        qty = to_float(o.get("remaining"))
+        if qty is None:
+            qty = to_float(o.get("total_quantity"))
+        working_sells += qty or 0.0
+    if working_sells + effective > long_qty:
+        return False, {"gate": "oversell",
+                       "reason": f"working SELL orders on stock "
+                                 f"con_id {con_id} already commit "
+                                 f"{working_sells:g} shares and this "
+                                 f"sell adds {effective:g}, exceeding "
+                                 f"the {long_qty:g} long shares; "
+                                 f"refusing to oversell the position"}
+    return True, {"effective_qty": effective,
+                  "position_qty": long_qty,
+                  "reduced": effective < float(row["quantity"]),
+                  "working_sells": working_sells}
+
+
+def gate_sell_price(row: dict, min_tick: float | None) -> tuple[bool, dict]:
+    """The human's sell limit must be positive; it is
+    tick-rounded on the verified stock contract's minTick, the
+    rounding carried in the detail so the caller posts it."""
+    target = to_float(row.get("target_limit"))
+    if target is None or target <= 0:
+        return False, {"gate": "price",
+                       "reason": f"target_limit {row.get('target_limit')} "
+                                 f"is not a usable sell limit "
+                                 f"(must be > 0)"}
+    limit = tick_round_to(target, min_tick)
+    return True, {"limit": limit, "target_limit": target,
+                  "limit_rounded": abs(limit - target) > 1e-9}
+
+
+def build_sell_order_spec(row: dict, effective_qty: float, limit: float,
+                          what_if: bool) -> dict:
+    """The frozen sell_shares shape — the ONLY stock order this
+    program can build: SELL / LMT / GTC / regular hours / single
+    STK leg, SMART/USD, orderRef = staged row id. `what_if` is
+    the single field that differs between the simulate preview
+    and the live transmit."""
+    return {
+        "contract": {
+            "conId": int(row["con_id"]),
+            "symbol": str(row.get("symbol") or ""),
+            "secType": "STK",
+            "exchange": "SMART",
+            "currency": "USD",
+            "lastTradeDateOrContractMonth": "",
+            "strike": 0.0,
+            "right": "",
+            "multiplier": "",
+        },
+        "order": {
+            "action": "SELL",
+            "orderType": "LMT",
+            "totalQuantity": float(effective_qty),
+            "lmtPrice": float(limit),
+            "tif": "GTC",
+            "outsideRth": False,
+            "orderRef": str(row["id"]),
+            "whatIf": bool(what_if),
+            "transmit": True,
+        },
+    }
+
+
+def sell_line(row: dict, qty: float, limit: float) -> str:
+    return (f"{row.get('symbol')} SELL SHARES {qty:g} @ {limit:.2f} "
+            f"GTC (row {row.get('id')})")
+
+
+def gate_share_wing_parent(row: dict, positions: dict | None,
+                           multiplier: float) -> tuple[bool, dict]:
+    """The hedge's parent is a SHARE position: the long shares
+    in parent_con_id must cover the wing contracts x the
+    resolved contract's multiplier. No position, or a non-long
+    one, refuses parent_position_missing; too few shares
+    refuses parent_qty_insufficient with the numbers."""
+    parent_con_id = int(row.get("parent_con_id") or 0)
+    position = (positions or {}).get(parent_con_id)
+    if position is None:
+        return False, {"gate": "parent_position_missing",
+                       "reason": f"no live position for parent stock "
+                                 f"con_id {parent_con_id} "
+                                 f"({row.get('parent_symbol')}); the "
+                                 f"hedge's shares are gone"}
+    long_qty = to_float(position.get("quantity")) or 0.0
+    if long_qty <= 0:
+        return False, {"gate": "parent_position_missing",
+                       "reason": f"parent position for stock con_id "
+                                 f"{parent_con_id} is not long "
+                                 f"(qty {long_qty}); the hedge's "
+                                 f"shares are gone"}
+    mult = float(multiplier or 100.0)
+    contracts = float(row["quantity"])
+    required = contracts * mult
+    if long_qty < required:
+        return False, {"gate": "parent_qty_insufficient",
+                       "reason": f"{contracts:g} wing contracts x "
+                                 f"{mult:g} = {required:g} shares "
+                                 f"required but only {long_qty:g} "
+                                 f"long shares in parent con_id "
+                                 f"{parent_con_id}; a hedge larger "
+                                 f"than the holding is not a hedge"}
+    return True, {"parent_qty": long_qty, "long_shares": long_qty,
+                  "contracts": contracts, "multiplier": mult,
+                  "required_shares": required}
+
+
+def gate_share_wing_rules(row: dict, verified: dict,
+                          parent_position: dict | None) -> tuple[bool, dict]:
+    """The share-hedge wing rules: the wing is a PUT (a hedge
+    against long shares is downside protection, never a call),
+    and its strike sits BELOW the parent stock's current market
+    price — a strike at or above spot is not the staged hedge,
+    it is a different trade. The spot comes from the fresh
+    positions read (market_price, merged from updatePortfolio);
+    a read that did not carry one cannot prove the rule, so it
+    refuses rather than guessing."""
+    if str(verified.get("right") or "") != "P":
+        return False, {"gate": "wing_rule_violation",
+                       "reason": f"wing rule [share hedge is a put] "
+                                 f"violated: wing right "
+                                 f"{verified.get('right') or '?'} "
+                                 f"!= P; a hedge against long shares "
+                                 f"buys puts, never calls"}
+    spot = to_float((parent_position or {}).get("market_price"))
+    wing_strike = to_float(verified.get("strike")) or 0.0
+    if spot is None:
+        return False, {"gate": "wing_rule_violation",
+                       "reason": f"wing rule [strike below spot] "
+                                 f"cannot be verified: the positions "
+                                 f"read carried no market price for "
+                                 f"parent stock con_id "
+                                 f"{row.get('parent_con_id')}; "
+                                 f"refusing rather than guessing "
+                                 f"spot against wing strike "
+                                 f"{wing_strike:g}"}
+    if not wing_strike < spot:
+        return False, {"gate": "wing_rule_violation",
+                       "reason": f"wing rule [strike below spot] "
+                                 f"violated: wing strike {wing_strike:g} "
+                                 f"is not below the parent stock's "
+                                 f"current price {spot:g}"}
+    return True, {"spot": spot}
+
+
+def resolve_cc_contract(row: dict, details: list[dict] | None) -> tuple[bool, dict]:
+    """A cc_open row whose con_id is 0 (the Shares-UI sentinel):
+    resolve it from the by-spec details read, exactly as wing
+    legs resolve — replies filtered to exact matches on symbol /
+    expiry / strike / right C and deduplicated by con_id. Zero
+    distinct contracts refuses contract_not_found, more than one
+    refuses contract_mismatch (an ambiguous contract is never
+    guessed)."""
+    label = (f"{row.get('symbol')} {row.get('expiry')} "
+             f"{row.get('strike')} Call")
+    if details is None:
+        return False, {"gate": "contract_not_found",
+                       "reason": f"contract details read failed while "
+                                 f"resolving cc_open {label}"}
+    matches: dict[int, dict] = {}
+    for d in details:
+        if _contract_mismatches(row.get("symbol"), row.get("expiry"),
+                                row.get("strike"), "C", d):
+            continue
+        matches[int(d.get("con_id") or 0)] = d
+    matches.pop(0, None)
+    if len(matches) == 0:
+        return False, {"gate": "contract_not_found",
+                       "reason": f"no contract matches cc_open {label}; "
+                                 f"the call does not exist as staged"}
+    if len(matches) > 1:
+        return False, {"gate": "contract_mismatch",
+                       "reason": f"cc_open {label} resolved to "
+                                 f"{len(matches)} distinct contracts "
+                                 f"{sorted(matches)}; refusing an "
+                                 f"ambiguous contract"}
+    verified = next(iter(matches.values()))
+    return True, {"verified": verified,
+                  "resolved_con_id": int(verified["con_id"])}
+
+
+# ---------------------------------------------------------------------------
 # Cancel gates (v0.3, unit-tested in tests/test_cancel_gates.py)
 #
 # A cancel row is a plain dict: the placement fields that identify the
@@ -1793,6 +2121,11 @@ def normalise_row(raw: dict) -> dict:
         "parent_strike": to_float(raw.get("parent_strike")) or 0.0,
         "parent_option_type": str(raw.get("parent_option_type") or ""),
         "parent_quantity": to_float(raw.get("parent_quantity")),
+        # v0.6: sell_shares rows carry the stock's sec_type, and
+        # share-parent wing rows carry parent_kind="shares"
+        # (absent on option-parent wings and every older row).
+        "sec_type": str(raw.get("sec_type") or ""),
+        "parent_kind": str(raw.get("parent_kind") or "").strip().lower(),
         # v0.3: staged action. Absent (every pre-v0.3 row) = "place".
         # A "cancel" row names ONE working order: target_order_id is
         # the broker-orders feed's order id, which Setu stores as the
@@ -1880,6 +2213,11 @@ class ExecGateway:
         self._reading = False
         self.positions: dict[int, dict] = {}
         self.positions_event = threading.Event()
+        # con_id -> market price from updatePortfolio (v0.6): the
+        # positions read merges these in so stock positions carry
+        # a current market price for the share-wing spot rule.
+        self.portfolio_prices: dict[int, float] = {}
+        self.portfolio_event = threading.Event()
         self.open_orders: list[dict] = []
         self.status_by_key: dict = {}
         self.fill_by_key: dict = {}  # key -> (filled, remaining), v0.3
@@ -1927,6 +2265,20 @@ class ExecGateway:
 
             def positionEnd(self):
                 outer.positions_event.set()
+
+            def updatePortfolio(self, contract, position, marketPrice,
+                                marketValue, averageCost, unrealizedPNL,
+                                realizedPNL, accountName):
+                if str(accountName or "") != outer.account:
+                    return
+                con_id = int(to_float(getattr(contract, "conId", 0)) or 0)
+                price = to_float(marketPrice)
+                if con_id and price is not None:
+                    outer.portfolio_prices[con_id] = price
+
+            def accountDownloadEnd(self, accountName):
+                if str(accountName or "") in ("", outer.account):
+                    outer.portfolio_event.set()
 
             def openOrder(self, orderId, contract, order, orderState):
                 acct = str(getattr(order, "account", "") or "")
@@ -2039,6 +2391,10 @@ class ExecGateway:
     # -- lifecycle ------------------------------------------------------
     def connect(self) -> bool:
         self.connected_event.clear()
+        # A fresh connection starts with an empty price cache;
+        # within a connection the cache is kept across reads
+        # (the account-updates subscription stays live).
+        self.portfolio_prices = {}
         try:
             self.client.connect(self.cfg["gateway_host"], int(self.cfg["gateway_port"]),
                                 int(self.cfg["exec_client_id"]))
@@ -2180,12 +2536,40 @@ class ExecGateway:
         self.read_error = None
         self._reading = True
         self.positions_event.clear()
+        self.portfolio_event.clear()
         try:
+            # v0.6: ride an account-updates snapshot alongside the
+            # positions read so each position can carry its current
+            # market price (updatePortfolio) — the share-wing
+            # strike-vs-spot rule reads it from the position. The
+            # merge is additive and best-effort: the read still
+            # completes on positionEnd alone, exactly as before,
+            # and a client without the call simply leaves prices
+            # unset (the share-wing gate then refuses honestly).
+            try:
+                self.client.reqAccountUpdates(True, self.account)
+            except Exception:
+                pass
+            # The subscription is never cancelled (see the
+            # finally block): the Gateway answers an unsubscribe
+            # with IB error 2100, delivered asynchronously, and
+            # the wrapper fails any read an untied error touches —
+            # an unsubscribe here poisons the NEXT read.
             self.client.reqPositions()
             if not self._wait_read(self.positions_event, timeout):
                 if self.read_error:
                     log(f"positions read failed: {self.read_error}")
                 return None
+            # Prices only matter for stock positions (share-wing
+            # parents); wait briefly for the snapshot only when
+            # one lacks a price, and never fail the read over it.
+            if any(str(p.get("sec_type") or "") == "STK"
+                   and int(p.get("con_id") or 0) not in self.portfolio_prices
+                   for p in self.positions.values()):
+                self.portfolio_event.wait(timeout=2.0)
+            for con_id, price in self.portfolio_prices.items():
+                if con_id in self.positions:
+                    self.positions[con_id]["market_price"] = price
             return dict(self.positions)
         finally:
             self._reading = False
@@ -2193,6 +2577,11 @@ class ExecGateway:
                 self.client.cancelPositions()
             except Exception:
                 pass
+            # Deliberately no reqAccountUpdates(False): staying
+            # subscribed just keeps the price map fresh between
+            # reads (the read daemon's posture), while an
+            # unsubscribe earns an asynchronous error 2100 that
+            # would fail the next read (see fetch_positions).
 
     def fetch_open_orders(self, timeout: float = 20.0) -> list[dict] | None:
         self.open_orders = []
@@ -2769,7 +3158,7 @@ class Executor:
                 continue
             kind = str(row.get("kind") or "gtc_close")
             if kind not in ("gtc_close", "cc_open", "close_now",
-                            "wing_open"):
+                            "wing_open", "sell_shares"):
                 # A kind this build does not understand (v0.4):
                 # ignore the row silently — never errored, never
                 # evented, so a newer Kubera can stage kinds ahead
@@ -2782,7 +3171,13 @@ class Executor:
             elif kind == "close_now":
                 self.process_close_row(row, positions, open_orders)
             elif kind == "wing_open":
-                self.process_wing_row(row, positions, open_orders)
+                if str(row.get("parent_kind") or "") == "shares":
+                    self.process_share_wing_row(row, positions,
+                                                open_orders)
+                else:
+                    self.process_wing_row(row, positions, open_orders)
+            elif kind == "sell_shares":
+                self.process_sell_row(row, positions, open_orders)
             else:
                 self.process_row(row, positions, open_orders)
 
@@ -2967,12 +3362,17 @@ class Executor:
                      f"[{detail.get('gate')}]: {detail.get('reason')}")
 
     def _report_cc_gate_failure(self, row: dict, detail: dict,
-                                line: str) -> None:
+                                line: str,
+                                res_extra: dict | None = None) -> None:
         """cc_open gate verdicts, mode-appropriate exactly like
         placements (v0.2.1 semantics): simulate failures are NOT
         terminal (posted as would_place with a simulate_gate_failed
         detail, returning the row to APPROVED), live failures are
-        gate_failed plus the refusal Pushover."""
+        gate_failed plus the refusal Pushover. res_extra carries
+        the v0.6 sentinel's resolved_con_id into the event detail
+        on failures past resolution, exactly as it rides the
+        success events."""
+        res_extra = res_extra or {}
         if self.mode == "simulate":
             log(f"SIMULATE GATE FAILED [{detail.get('gate')}] {line}"
                 f" — {detail.get('reason')}")
@@ -2980,11 +3380,11 @@ class Executor:
                 "simulate_gate_failed": True,
                 "gate": detail.get("gate"),
                 "reason": detail.get("reason"),
-                "kind": "cc_open"})
+                "kind": "cc_open", **res_extra})
             return
         log(f"GATE FAILED [{detail.get('gate')}] {line}"
             f" — {detail.get('reason')}")
-        self._report(row["id"], "gate_failed", detail)
+        self._report(row["id"], "gate_failed", {**detail, **res_extra})
         self._notify("setu-exec: gate refusal",
                      f"{self.account} {line} — refused at gate "
                      f"[{detail.get('gate')}]: {detail.get('reason')}")
@@ -3222,6 +3622,35 @@ class Executor:
                                 "never acted on"}
             self._report_cc_gate_failure(row, detail, line)
             return
+        resolved_con_id = None
+        if int(row["con_id"]) == 0:
+            # v0.6 sentinel: Kubera's Shares-UI staging stores 0
+            # for a not-yet-held call (Molang-staged rows carry
+            # real con_ids and never reach this branch). Resolve
+            # by spec first; exactly one distinct contract swaps
+            # its id into a local copy of the row and the
+            # EXISTING pipeline runs untouched from here.
+            try:
+                spec_details = self.gateway.fetch_contract_details_by_spec(
+                    str(row.get("symbol") or ""),
+                    str(row.get("expiry") or ""),
+                    float(row.get("strike") or 0.0), "C")
+            except Exception as exc:
+                log(f"contract resolution raised for cc_open "
+                    f"{row.get('symbol')} {row.get('expiry')} "
+                    f"{row.get('strike')} ({type(exc).__name__}: {exc})")
+                spec_details = None
+            ok, detail = resolve_cc_contract(row, spec_details)
+            if not ok:
+                self._report_cc_gate_failure(row, detail, line)
+                return
+            resolved_con_id = detail["resolved_con_id"]
+            row = {**row, "con_id": resolved_con_id}
+            log(f"cc_open sentinel resolved: {row.get('symbol')} "
+                f"{row.get('expiry')} {row.get('strike')}C -> con_id "
+                f"{resolved_con_id}")
+        res_extra = ({"resolved_con_id": resolved_con_id}
+                     if resolved_con_id is not None else {})
         try:
             details = self.gateway.fetch_contract_details(int(row["con_id"]))
         except Exception as exc:
@@ -3230,21 +3659,21 @@ class Executor:
             details = None
         ok, detail = gate_cc_contract(row, details)
         if not ok:
-            self._report_cc_gate_failure(row, detail, line)
+            self._report_cc_gate_failure(row, detail, line, res_extra)
             return
         verified = detail["verified"]
         mult = to_float(verified.get("multiplier")) or 100.0
         ok, detail = gate_cc_cover(row, positions, open_orders, mult)
         if not ok:
-            self._report_cc_gate_failure(row, detail, line)
+            self._report_cc_gate_failure(row, detail, line, res_extra)
             return
         ok, detail = gate_cc_duplicate(row, open_orders)
         if not ok:
-            self._report_cc_gate_failure(row, detail, line)
+            self._report_cc_gate_failure(row, detail, line, res_extra)
             return
         ok, detail = gate_cc_price(row, to_float(verified.get("min_tick")))
         if not ok:
-            self._report_cc_gate_failure(row, detail, line)
+            self._report_cc_gate_failure(row, detail, line, res_extra)
             return
         limit = detail["limit"]
         line = cc_line(row, row["quantity"], limit)
@@ -3260,13 +3689,13 @@ class Executor:
             reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         ok, wdetail = gate_cc_whatif(reply)
         if not ok:
-            self._report_cc_gate_failure(row, wdetail, line)
+            self._report_cc_gate_failure(row, wdetail, line, res_extra)
             return
 
         if self.mode == "simulate":
             log(f"WOULD PLACE {line}")
             out = {"order": preview, "whatif": wdetail["whatif"],
-                   "kind": "cc_open", "limit": limit}
+                   "kind": "cc_open", "limit": limit, **res_extra}
             if detail["limit_rounded"]:
                 out["limit_rounded_from"] = detail["target_limit"]
             self._report(row["id"], "would_place", out)
@@ -3285,7 +3714,7 @@ class Executor:
                     f"row left APPROVED until the daily count resets")
             self._report(row["id"], "would_place", {
                 "deferred": True, "gate": "runaway_brake",
-                "reason": brake_reason, "kind": "cc_open"})
+                "reason": brake_reason, "kind": "cc_open", **res_extra})
             return
         spec = build_cc_order_spec(row, limit, what_if=False,
                                    multiplier=mult)
@@ -3313,7 +3742,7 @@ class Executor:
             log(f"PLACEMENT REJECTED {line} — {result['error']}")
             self._report(row["id"], "rejected",
                          {"reason": result["error"], "order": spec,
-                          "kind": "cc_open"})
+                          "kind": "cc_open", **res_extra})
             self.tracker.drop(row["id"])
             return
         if not result.get("status") and not result.get("perm_id"):
@@ -3332,7 +3761,7 @@ class Executor:
             f"perm {result.get('perm_id')}")
         out = {"broker_order_id": result.get("order_id"),
                "perm_id": result.get("perm_id"), "order": spec,
-               "kind": "cc_open"}
+               "kind": "cc_open", **res_extra}
         if detail["limit_rounded"]:
             out["limit_rounded_from"] = detail["target_limit"]
         self._report(row["id"], "placed", out)
@@ -3615,6 +4044,302 @@ class Executor:
             "broker_order_id": result.get("order_id"),
             "perm_id": result.get("perm_id"), "order": spec,
             "kind": "wing_open", "wing_con_id": wing_con_id, **extra})
+        self._notify("setu-exec: order placed",
+                     f"{self.account} {line} — PLACED order "
+                     f"{result.get('order_id')} perm {result.get('perm_id')}")
+
+    # -- one staged sell_shares row (v0.6) --------------------------------
+    def process_sell_row(self, row: dict, positions: dict[int, dict] | None,
+                         open_orders: list[dict] | None) -> None:
+        line = sell_line(row, row["quantity"], row["target_limit"] or 0)
+        self._report(row["id"], "placing", {"mode": self.mode,
+                                            "kind": "sell_shares"})
+        if positions is None or open_orders is None:
+            detail = {"gate": "reads_incomplete",
+                      "reason": "live Gateway reads did not complete; "
+                                "refusing to evaluate gates on partial data"}
+            self._report_open_gate_failure(row, detail, line)
+            return
+        if str(row.get("approval_mode") or "") == "bypass":
+            detail = {"gate": "bypass_not_supported",
+                      "reason": "sell_shares rows are manual-approval "
+                                "only; a bypass-stamped sell_shares row "
+                                "is refused, never acted on"}
+            self._report_open_gate_failure(row, detail, line)
+            return
+        ok, detail = gate_sell_tif(row)
+        if not ok:
+            self._report_open_gate_failure(row, detail, line)
+            return
+        try:
+            details = self.gateway.fetch_contract_details(int(row["con_id"]))
+        except Exception as exc:
+            log(f"contract details raised for con_id {row['con_id']} "
+                f"({type(exc).__name__}: {exc})")
+            details = None
+        ok, detail = gate_sell_contract(row, details)
+        if not ok:
+            self._report_open_gate_failure(row, detail, line)
+            return
+        verified = detail["verified"]
+        position = positions.get(int(row["con_id"]))
+        ok, detail = gate_sell_position(row, position, open_orders)
+        if not ok:
+            self._report_open_gate_failure(row, detail, line)
+            return
+        qty = detail["effective_qty"]
+        reduced = detail["reduced"]
+        position_qty = detail["position_qty"]
+        ok, pdetail = gate_sell_price(row, to_float(verified.get("min_tick")))
+        if not ok:
+            self._report_open_gate_failure(row, pdetail, line)
+            return
+        limit = pdetail["limit"]
+        line = sell_line(row, qty, limit)
+        if reduced:
+            log(f"note: live holding is smaller than staged; selling "
+                f"{qty:g} of {row['quantity']:g} for row {row['id']}")
+
+        preview = build_sell_order_spec(row, qty, limit, what_if=True)
+        try:
+            reply = self.gateway.whatif(preview)
+        except Exception as exc:
+            reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        ok, wdetail = gate_whatif(reply)
+        if not ok:
+            self._report_open_gate_failure(row, wdetail, line)
+            return
+
+        extra = {}
+        if reduced:
+            extra = {"reduced": True, "position_qty": position_qty}
+        if pdetail["limit_rounded"]:
+            extra["limit_rounded_from"] = pdetail["target_limit"]
+        if self.mode == "simulate":
+            log(f"WOULD PLACE {line}")
+            self._report(row["id"], "would_place", {
+                "order": preview, "whatif": wdetail["whatif"],
+                "kind": "sell_shares", "effective_qty": qty, **extra})
+            return
+
+        # Live: shared runaway brake, deferring exactly like a
+        # placement (the row returns to APPROVED via would_place).
+        brake_ok, brake_reason = self.tracker.brake_check()
+        if not brake_ok:
+            wait = self.tracker.brake_wait_seconds()
+            if wait is not None:
+                log(f"RUNAWAY BRAKE [defer] {line} — {brake_reason}; "
+                    f"retry in ~{wait:.0f}s, row left APPROVED")
+            else:
+                log(f"RUNAWAY BRAKE [defer] {line} — {brake_reason}; "
+                    f"row left APPROVED until the daily count resets")
+            self._report(row["id"], "would_place", {
+                "deferred": True, "gate": "runaway_brake",
+                "reason": brake_reason, "kind": "sell_shares"})
+            return
+        spec = build_sell_order_spec(row, qty, limit, what_if=False)
+        # Record BEFORE transmitting, counted before the attempt —
+        # the placement discipline exactly (see process_row).
+        self.tracker.add(row["id"], {
+            "order_ref": str(row["id"]), "account": self.account,
+            "kind": "sell_shares",
+            "confirmed": False, "broker_order_id": None, "perm_id": None,
+            "last_status": "",
+            "placed_at": datetime.now(LONDON).isoformat(timespec="seconds"),
+            "order": spec})
+        self.tracker.record_transmission()
+        try:
+            result = self.gateway.transmit(spec)
+        except Exception as exc:
+            result = {"order_id": None, "perm_id": 0, "status": "",
+                      "error": f"{type(exc).__name__}: {exc}"}
+        if result.get("error"):
+            log(f"PLACEMENT REJECTED {line} — {result['error']}")
+            self._report(row["id"], "rejected",
+                         {"reason": result["error"], "order": spec,
+                          "kind": "sell_shares"})
+            self.tracker.drop(row["id"])
+            return
+        if not result.get("status") and not result.get("perm_id"):
+            log(f"PLACED (unconfirmed) {line} — no Gateway reply yet; "
+                f"tracking by orderRef")
+            self._notify("setu-exec: order placed (unconfirmed)",
+                         f"{self.account} {line} — transmitted, no Gateway "
+                         f"confirmation yet; tracked by orderRef")
+            return
+        self.tracker.update(row["id"], confirmed=True,
+                            broker_order_id=result.get("order_id"),
+                            perm_id=result.get("perm_id") or None,
+                            last_status=result.get("status") or "")
+        log(f"PLACED {line} — order {result.get('order_id')} "
+            f"perm {result.get('perm_id')}")
+        self._report(row["id"], "placed", {
+            "broker_order_id": result.get("order_id"),
+            "perm_id": result.get("perm_id"), "order": spec,
+            "kind": "sell_shares", **extra})
+        self._notify("setu-exec: order placed",
+                     f"{self.account} {line} — PLACED order "
+                     f"{result.get('order_id')} perm {result.get('perm_id')}")
+
+    # -- one staged share-parent wing row (v0.6) ---------------------------
+    def _fetch_wing_identity(self, row: dict) -> tuple[bool, dict]:
+        """The wing identity read shared by the share-parent path
+        (the option-parent path keeps its own inline copy,
+        untouched): a carried con_id is verified, a con_id of 0
+        is resolved from the leg's own fields."""
+        if int(row["con_id"]) > 0:
+            try:
+                details = self.gateway.fetch_contract_details(
+                    int(row["con_id"]))
+            except Exception as exc:
+                log(f"contract details raised for con_id {row['con_id']} "
+                    f"({type(exc).__name__}: {exc})")
+                details = None
+            return gate_wing_contract(row, details)
+        try:
+            details = self.gateway.fetch_contract_details_by_spec(
+                str(row.get("symbol") or ""), str(row.get("expiry") or ""),
+                float(row.get("strike") or 0.0), _row_right(row))
+        except Exception as exc:
+            log(f"contract resolution raised for wing "
+                f"{row.get('symbol')} {row.get('expiry')} "
+                f"{row.get('strike')} ({type(exc).__name__}: {exc})")
+            details = None
+        return resolve_wing_contract(row, details)
+
+    def process_share_wing_row(self, row: dict,
+                               positions: dict[int, dict] | None,
+                               open_orders: list[dict] | None) -> None:
+        line = wing_line(row, row["quantity"], row["target_limit"] or 0,
+                         int(row["con_id"]))
+        self._report(row["id"], "placing", {"mode": self.mode,
+                                            "kind": "wing_open",
+                                            "parent_kind": "shares"})
+        if positions is None or open_orders is None:
+            detail = {"gate": "reads_incomplete",
+                      "reason": "live Gateway reads did not complete; "
+                                "refusing to evaluate gates on partial data"}
+            self._report_open_gate_failure(row, detail, line)
+            return
+        if str(row.get("approval_mode") or "") == "bypass":
+            detail = {"gate": "bypass_not_supported",
+                      "reason": "wing_open rows are manual-approval only; "
+                                "a bypass-stamped wing_open row is "
+                                "refused, never acted on"}
+            self._report_open_gate_failure(row, detail, line)
+            return
+        # Wing identity FIRST on this path (the parent check needs
+        # the resolved contract's multiplier).
+        ok, detail = self._fetch_wing_identity(row)
+        if not ok:
+            self._report_open_gate_failure(row, detail, line)
+            return
+        verified = detail["verified"]
+        wing_con_id = int(verified["con_id"])
+        mult = to_float(verified.get("multiplier")) or 100.0
+        parent_con_id = int(row.get("parent_con_id") or 0)
+        ok, detail = gate_share_wing_parent(row, positions, mult)
+        if not ok:
+            self._report_open_gate_failure(row, detail, line)
+            return
+        parent_position = positions.get(parent_con_id)
+        ok, detail = gate_share_wing_rules(row, verified, parent_position)
+        if not ok:
+            self._report_open_gate_failure(row, detail, line)
+            return
+        ok, detail = gate_wing_duplicate(row, open_orders, wing_con_id)
+        if not ok:
+            self._report_open_gate_failure(row, detail, line)
+            return
+        ok, pdetail = gate_wing_price(row, to_float(verified.get("min_tick")))
+        if not ok:
+            self._report_open_gate_failure(row, pdetail, line)
+            return
+        limit = pdetail["limit"]
+        line = wing_line(row, row["quantity"], limit, wing_con_id)
+
+        preview = build_wing_order_spec(row, verified, limit,
+                                        what_if=True)
+        try:
+            reply = self.gateway.whatif(preview)
+        except Exception as exc:
+            reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        ok, wdetail = gate_whatif(reply)
+        if not ok:
+            self._report_open_gate_failure(row, wdetail, line)
+            return
+
+        extra = {}
+        if pdetail["limit_rounded"]:
+            extra["limit_rounded_from"] = pdetail["target_limit"]
+        if self.mode == "simulate":
+            log(f"WOULD PLACE {line}")
+            self._report(row["id"], "would_place", {
+                "order": preview, "whatif": wdetail["whatif"],
+                "kind": "wing_open", "parent_kind": "shares",
+                "wing_con_id": wing_con_id, **extra})
+            return
+
+        # Live: shared runaway brake, deferring exactly like a
+        # placement (the row returns to APPROVED via would_place).
+        brake_ok, brake_reason = self.tracker.brake_check()
+        if not brake_ok:
+            wait = self.tracker.brake_wait_seconds()
+            if wait is not None:
+                log(f"RUNAWAY BRAKE [defer] {line} — {brake_reason}; "
+                    f"retry in ~{wait:.0f}s, row left APPROVED")
+            else:
+                log(f"RUNAWAY BRAKE [defer] {line} — {brake_reason}; "
+                    f"row left APPROVED until the daily count resets")
+            self._report(row["id"], "would_place", {
+                "deferred": True, "gate": "runaway_brake",
+                "reason": brake_reason, "kind": "wing_open",
+                "parent_kind": "shares"})
+            return
+        spec = build_wing_order_spec(row, verified, limit,
+                                     what_if=False)
+        # Record BEFORE transmitting, counted before the attempt —
+        # the placement discipline exactly (see process_row).
+        self.tracker.add(row["id"], {
+            "order_ref": str(row["id"]), "account": self.account,
+            "kind": "wing_open", "parent_kind": "shares",
+            "wing_con_id": wing_con_id,
+            "confirmed": False, "broker_order_id": None, "perm_id": None,
+            "last_status": "",
+            "placed_at": datetime.now(LONDON).isoformat(timespec="seconds"),
+            "order": spec})
+        self.tracker.record_transmission()
+        try:
+            result = self.gateway.transmit(spec)
+        except Exception as exc:
+            result = {"order_id": None, "perm_id": 0, "status": "",
+                      "error": f"{type(exc).__name__}: {exc}"}
+        if result.get("error"):
+            log(f"PLACEMENT REJECTED {line} — {result['error']}")
+            self._report(row["id"], "rejected",
+                         {"reason": result["error"], "order": spec,
+                          "kind": "wing_open", "parent_kind": "shares",
+                          "wing_con_id": wing_con_id})
+            self.tracker.drop(row["id"])
+            return
+        if not result.get("status") and not result.get("perm_id"):
+            log(f"PLACED (unconfirmed) {line} — no Gateway reply yet; "
+                f"tracking by orderRef")
+            self._notify("setu-exec: order placed (unconfirmed)",
+                         f"{self.account} {line} — transmitted, no Gateway "
+                         f"confirmation yet; tracked by orderRef")
+            return
+        self.tracker.update(row["id"], confirmed=True,
+                            broker_order_id=result.get("order_id"),
+                            perm_id=result.get("perm_id") or None,
+                            last_status=result.get("status") or "")
+        log(f"PLACED {line} — order {result.get('order_id')} "
+            f"perm {result.get('perm_id')}")
+        self._report(row["id"], "placed", {
+            "broker_order_id": result.get("order_id"),
+            "perm_id": result.get("perm_id"), "order": spec,
+            "kind": "wing_open", "parent_kind": "shares",
+            "wing_con_id": wing_con_id, **extra})
         self._notify("setu-exec: order placed",
                      f"{self.account} {line} — PLACED order "
                      f"{result.get('order_id')} perm {result.get('perm_id')}")
