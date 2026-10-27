@@ -254,6 +254,70 @@ class RunJobTests(unittest.TestCase):
                                   client_factory=lambda t: StubClient())
 
 
+FLEX_MINI = (
+    "HEADER,CRTT,ClientAccountID,AccountAlias,Model,"
+    "CurrencyPrimary,LevelOfDetail,FromDate,ToDate,StartingCash,"
+    "EndingCash\n"
+    "DATA,CRTT,acct,zonito,,BASE_SUMMARY,BaseCurrency,20261001,"
+    "20261026,1000,900\n"
+    "DATA,CRTT,acct,zonito,,USD,Currency,20261001,20261026,1000,"
+    "900\n"
+    "HEADER,TRNT,ClientAccountID,AccountAlias,Model,"
+    "CurrencyPrimary,FXRateToBase,AssetClass,SubCategory,Symbol,"
+    "Description,TradeDate,TransactionType,Quantity,TradePrice,"
+    "Proceeds,IBCommission,NetCash,Buy/Sell,Notes/Codes,MtmPnl\n"
+    "DATA,TRNT,acct,zonito,,USD,1,STK,COMMON,XYZ,XYZ CORP,"
+    "20261020,ExchTrade,7,26.73,-187.11,-0.34257825,,BUY,,0\n"
+    "HEADER,CTRN,ClientAccountID,AccountAlias,Model,"
+    "CurrencyPrimary,FXRateToBase,Symbol,Description,Date/Time,"
+    "Amount,Type\n"
+)
+
+
+class ConvertModeTests(unittest.TestCase):
+    def make_job(self, tmp, convert=True):
+        token_file = Path(tmp) / "token.txt"
+        token_file.write_text("TOK999", encoding="utf-8")
+        return {"name": "zonito", "account_id": "U19377323",
+                "query_id": "1687614", "token_file": str(token_file),
+                "output_dir": str(Path(tmp) / "drive"),
+                "convert": convert}
+
+    def test_convert_job_writes_statement_and_raw_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = self.make_job(tmp)
+            factory = lambda token: StubClient(body=FLEX_MINI)
+            result = flex_pull.run_job(
+                job, date(2026, 10, 27), client_factory=factory,
+                backup_root=Path(tmp) / "backups")
+            self.assertTrue(result["converted"])
+            written = Path(result["file"]).read_text(encoding="utf-8")
+            self.assertTrue(
+                written.startswith("Statement,Header"))
+            self.assertIn("Transaction History,Data,2026-10-20",
+                          written)
+            raw = list((Path(tmp) / "backups").glob("*flex-raw*.csv"))
+            self.assertEqual(len(raw), 1)
+            self.assertEqual(raw[0].read_text(encoding="utf-8"),
+                             FLEX_MINI)
+
+    def test_convert_warning_fails_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = self.make_job(tmp)
+            out_dir = Path(job["output_dir"])
+            out_dir.mkdir(parents=True)
+            target = out_dir / "Oct26.csv"
+            target.write_text("OLD", encoding="utf-8")
+            bad = FLEX_MINI.replace("ExchTrade", "MysteryTrade")
+            factory = lambda token: StubClient(body=bad)
+            with self.assertRaises(flex_pull.FlexError):
+                flex_pull.run_job(job, date(2026, 10, 27),
+                                  client_factory=factory,
+                                  backup_root=Path(tmp) / "backups")
+            self.assertEqual(target.read_text(encoding="utf-8"),
+                             "OLD")
+
+
 class ConfigTests(unittest.TestCase):
     def test_load_config_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -25,6 +25,12 @@ Config: ~/.setu/flex-pull.json
       ... one job per account ...
     ]}
 
+A job may set "convert": true — its query is then the
+SetuTxHistory Activity Flex Query and flex_pull rebuilds the
+Transaction History statement from it via flex_convert before
+validating and writing (the raw Flex CSV is kept in
+~/.setu/flex-backups). Conversion warnings fail the job.
+
 Usage:
   flex_pull.py run [--config PATH] [--date YYYY-MM-DD]
 
@@ -49,7 +55,7 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-FLEX_PULL_VERSION = "0.1.0"
+FLEX_PULL_VERSION = "0.2.0"
 FLEX_BASE = ("https://ndcdyn.interactivebrokers.com"
              "/Universal/servlet/FlexStatementService")
 # IBKR error 1019: statement generation in progress — retryable.
@@ -235,6 +241,34 @@ def run_job(job: dict, asof: date, client_factory=None,
     client = factory(token)
     start, end, stem = month_window(asof)
     csv_text = client.fetch(job["query_id"], start, end)
+    raw_text = csv_text
+    converted = False
+    if job.get("convert"):
+        # The morning file is a portal statement, not a Flex
+        # query; the SetuTxHistory Activity output is rebuilt
+        # into it by flex_convert (see that module). A warning
+        # means an unmapped source row: fail the job rather
+        # than write a partial statement over a good file.
+        try:
+            import flex_convert
+        except ImportError as exc:
+            raise FlexError(
+                "convert mode needs flex_convert.py beside "
+                "flex_pull.py") from exc
+        csv_text, conv_warnings = flex_convert.convert(
+            csv_text, start.strftime("%Y%m%d"),
+            end.strftime("%Y%m%d"),
+            generated_at=datetime.now().astimezone())
+        if conv_warnings:
+            raise FlexError(
+                "conversion incomplete: "
+                + "; ".join(conv_warnings[:5]))
+        converted = True
+        if backup_root is not None:
+            backup_root.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            (backup_root / f"{name}-{stem}-flex-raw-{stamp}.csv"
+             ).write_text(raw_text, encoding="utf-8")
     info = validate_statement(csv_text)
     out_dir = Path(job["output_dir"]).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -249,7 +283,7 @@ def run_job(job: dict, asof: date, client_factory=None,
     os.replace(tmp_path, target)
     return {"job": name, "account_id": job["account_id"], "ok": True,
             "file": str(target), "rows": info["rows"],
-            "period": info["period"]}
+            "period": info["period"], "converted": converted}
 
 
 def main(argv=None) -> int:

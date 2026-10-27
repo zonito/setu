@@ -652,23 +652,33 @@ daily 06:45 local). A statement is written only after it
 validates as the Transaction History statement with data rows;
 the file it replaces is first copied to `~/.setu/flex-backups/`.
 
+The morning file is a portal statement, not a Flex query —
+no Flex section reproduces it directly. Instead the job runs
+the **SetuTxHistory** Activity Flex Query and `flex_convert.py`
+rebuilds the statement from it (verified byte-for-byte against
+a hand-downloaded statement: every trade, assignment, dividend,
+interest, fee and VAT row; the only known difference is the
+Forex Trade Component amount, whose exact value needs IBKR's
+daily translation rate — the importer skips that row type).
+
 One-time portal setup, per login:
 
 1. **Save the query.** Reports → Flex Queries → create an
-   Activity Flex Query containing the **Transaction History**
-   section with the fields the morning file carries (Date,
-   Account, Description, Transaction Type, Symbol, Quantity,
-   Price, Price Currency, Gross Amount, Commission, Net
-   Amount), format CSV. Note its Query ID.
-2. **Generate a token.** Reports → Flex Web Service (under
-   Settings in some layouts) → generate a token for the login.
-   The token is a credential: save it to
+   Activity Flex Query named `SetuTxHistory`: sections
+   **Trades, Cash Transactions, Cash Report, Transaction
+   Fees**, all fields, Format **CSV**, *Include section code
+   and line descriptor* **Yes**, *Display Account Alias in
+   Place of Account ID* **Yes**, Period Month to Date. Note
+   its Query ID.
+2. **Generate a token.** Flex Queries → Flex Web Service
+   Configuration → generate a token for the login. The token
+   is a credential: save it to
    `~/.setu/flex-token-<account>.txt` (mode 600) on that
    account's machine. Never in the repo, never in chat.
 3. **Configure.** Add a job per account to
    `~/.setu/flex-pull.json`: name, account_id, query_id,
-   token_file, and output_dir (the local synced Drive folder
-   for that person).
+   token_file, output_dir (the local synced Drive folder for
+   that person), and `"convert": true`.
 
 The fetcher passes explicit from/to dates (month start →
 yesterday) on every request, polls while IBKR answers 1019

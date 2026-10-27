@@ -25,7 +25,7 @@ fi
 mkdir -p "$SETU_HOME/logs" "$HOME/Library/LaunchAgents"
 
 echo "1/3 Program"
-cp flex_pull.py "$SETU_HOME/flex_pull.py"
+cp flex_pull.py flex_convert.py "$SETU_HOME/"
 
 echo "2/3 Flex config"
 if [ -f "$SETU_HOME/flex-pull.json" ]; then
