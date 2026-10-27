@@ -144,3 +144,9 @@ Notes:
   institutional clients). The transport is invisible to this
   contract: same endpoints, same gates, same events. A lapsed
   gateway login surfaces as a `web_session` refusal.
+- Orders-fetch warm-up (v0.9.1): the first orders read after a
+  session initialises can return an empty stub while the
+  blotter assembles. Both transports re-fetch an empty list up
+  to 3 attempts before the identity match sees it; a non-empty
+  list is never re-fetched and a still-empty list refuses at
+  `web_identity` as before.

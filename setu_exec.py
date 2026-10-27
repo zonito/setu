@@ -527,7 +527,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -3963,6 +3963,33 @@ def _parse_live_orders_payload(payload) -> list[dict]:
     raise WebApiError("live orders response carries no orders list")
 
 
+_ORDERS_WARM_ATTEMPTS = 3
+_ORDERS_WARM_INTERVAL_S = 2.5
+
+
+def _fetch_live_orders_warm(fetch_once, sleeper=None):
+    """Fetch the live-orders list, warming the blotter if needed.
+
+    The iserver orders endpoint answers the first call after a
+    brokerage session is initialised with an empty stub while it
+    assembles the blotter (proven live 2026-10-27: first call 0
+    orders, second call the full 35). An empty list therefore
+    earns a short wait and a re-fetch, a bounded number of times;
+    a non-empty list is authoritative and returns at once. A list
+    that stays empty after the attempts is returned as-is: the
+    gates above treat "target not found" as a refusal, never as
+    licence to act.
+    """
+    sleep = sleeper if sleeper is not None else time.sleep
+    orders = fetch_once()
+    attempts = 1
+    while not orders and attempts < _ORDERS_WARM_ATTEMPTS:
+        sleep(_ORDERS_WARM_INTERVAL_S)
+        orders = fetch_once()
+        attempts += 1
+    return orders
+
+
 class WebApiClient:
     """One short-lived OAuth session against api.ibkr.com.
 
@@ -3972,12 +3999,14 @@ class WebApiClient:
     between poll cycles. The transport is injectable for tests."""
 
     def __init__(self, creds: WebApiCredentials, transport=None,
-                 nonce_source=None, dh_random_source=None):
+                 nonce_source=None, dh_random_source=None,
+                 orders_sleeper=None):
         self.creds = creds
         self._transport = transport or _webapi_default_transport
         self._nonce_source = nonce_source or (lambda: secrets.token_hex(10))
         self._dh_random_source = (dh_random_source
                                   or (lambda: secrets.randbits(256)))
+        self._orders_sleeper = orders_sleeper
         self._lst: bytes | None = None
         self._timestamp_floor = 0
 
@@ -4104,8 +4133,10 @@ class WebApiClient:
         return []
 
     def live_orders(self) -> list[dict]:
-        payload = self._request_or_raise("GET", "/iserver/account/orders")
-        return _parse_live_orders_payload(payload)
+        return _fetch_live_orders_warm(
+            lambda: _parse_live_orders_payload(
+                self._request_or_raise("GET", "/iserver/account/orders")),
+            sleeper=self._orders_sleeper)
 
     def cancel_order(self, account_id: str, web_order_id: str) -> dict:
         payload = self._request_or_raise(
@@ -4126,9 +4157,11 @@ class CpGatewayClient:
     proves, and a lapsed login raises WebApiError so the cancel
     fails closed at gate web_session."""
 
-    def __init__(self, base_url: str, transport=None):
+    def __init__(self, base_url: str, transport=None,
+                 orders_sleeper=None):
         self.base_url = base_url.rstrip("/")
         self._transport = transport or _cp_gateway_transport
+        self._orders_sleeper = orders_sleeper
 
     def _request_or_raise(self, method: str, path: str, json_body=None):
         headers = {}
@@ -4182,8 +4215,10 @@ class CpGatewayClient:
         return []
 
     def live_orders(self) -> list[dict]:
-        payload = self._request_or_raise("GET", "/iserver/account/orders")
-        return _parse_live_orders_payload(payload)
+        return _fetch_live_orders_warm(
+            lambda: _parse_live_orders_payload(
+                self._request_or_raise("GET", "/iserver/account/orders")),
+            sleeper=self._orders_sleeper)
 
     def cancel_order(self, account_id: str, web_order_id: str) -> dict:
         payload = self._request_or_raise(

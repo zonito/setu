@@ -630,6 +630,15 @@ browser. Everything else — gates, identity match, brake
 accounting, dual-view verification, streaks — is identical to
 the OAuth transport. `webapi_probe.py` speaks both modes.
 
+v0.9.1: the orders fetch warms up. The iserver orders endpoint
+answers the first call after a session is initialised with an
+empty stub while it assembles the blotter (proven live
+2026-10-27: 0 orders, then the full list). Both transports now
+re-fetch an empty list up to 3 attempts, 2.5s apart; a non-empty
+list is authoritative and errors are never retried. A list that
+stays empty is returned as-is and the identity gate refuses, as
+before.
+
 ## Config — `~/.setu/config.json`
 
 | Key | Meaning |

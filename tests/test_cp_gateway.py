@@ -169,6 +169,71 @@ class CpClientTests(unittest.TestCase):
             payload["iserver"]["authStatus"]["authenticated"])
 
 
+class CpWarmUpTests(unittest.TestCase):
+    """v0.9.1: the iserver orders endpoint answers the first call
+    after session init with an empty stub (proven live 2026-10-27:
+    0 orders, then the full blotter). live_orders must wait and
+    re-fetch a bounded number of times; a non-empty list returns
+    at once; a list that stays empty is returned as-is."""
+
+    def make_client(self, responder):
+        calls = []
+        sleeps = []
+
+        def transport(method, url, headers, body):
+            calls.append((method, url))
+            return responder(method, url, body)
+
+        client = setu_exec.CpGatewayClient(
+            "https://localhost:5000/v1/api", transport=transport,
+            orders_sleeper=sleeps.append)
+        return client, calls, sleeps
+
+    def test_warm_up_retries_until_blotter_arrives(self):
+        state = {"n": 0}
+
+        def responder(method, url, body):
+            state["n"] += 1
+            if state["n"] == 1:
+                return 200, {"orders": []}
+            return 200, {"orders": [web_entry()]}
+
+        client, calls, sleeps = self.make_client(responder)
+        orders = client.live_orders()
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sleeps, [setu_exec._ORDERS_WARM_INTERVAL_S])
+
+    def test_warm_up_gives_up_after_bounded_attempts(self):
+        def responder(method, url, body):
+            return 200, {"orders": []}
+
+        client, calls, sleeps = self.make_client(responder)
+        self.assertEqual(client.live_orders(), [])
+        self.assertEqual(len(calls), setu_exec._ORDERS_WARM_ATTEMPTS)
+        self.assertEqual(len(sleeps),
+                         setu_exec._ORDERS_WARM_ATTEMPTS - 1)
+
+    def test_nonempty_list_returns_immediately(self):
+        def responder(method, url, body):
+            return 200, {"orders": [web_entry()]}
+
+        client, calls, sleeps = self.make_client(responder)
+        self.assertEqual(len(client.live_orders()), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [])
+
+    def test_http_error_is_not_retried(self):
+        def responder(method, url, body):
+            return 401, {"error": "not authenticated"}
+
+        client, calls, sleeps = self.make_client(responder)
+        with self.assertRaises(setu_exec.WebApiError):
+            client.live_orders()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [])
+
+
 class FakeCpClient(FakeWebClient):
     """FakeWebClient plus the CP tickle; auth state scriptable."""
 
