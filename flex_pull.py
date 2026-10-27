@@ -55,7 +55,7 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-FLEX_PULL_VERSION = "0.2.0"
+FLEX_PULL_VERSION = "0.2.1"
 FLEX_BASE = ("https://ndcdyn.interactivebrokers.com"
              "/Universal/servlet/FlexStatementService")
 # IBKR error 1019: statement generation in progress — retryable.
@@ -187,8 +187,12 @@ class FlexClient:
               max_wait_s: int = DEFAULT_MAX_WAIT_S,
               interval_s: int = DEFAULT_INTERVAL_S) -> str:
         reference = self.send_request(query_id, from_date, to_date)
+        # GetStatement takes the reference in q, like
+        # SendRequest takes the query id — a "ref" parameter
+        # is ignored and IBKR answers 1020 (seen live
+        # 2026-10-27, flex_pull 0.2.0).
         query = urllib.parse.urlencode({
-            "t": self._token, "ref": reference, "v": "3"})
+            "t": self._token, "q": reference, "v": "3"})
         url = f"{FLEX_BASE}.GetStatement?{query}"
         waited = 0
         while True:

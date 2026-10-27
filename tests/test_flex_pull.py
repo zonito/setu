@@ -124,7 +124,12 @@ class FetchFlowTests(unittest.TestCase):
         self.assertIn("q=987", send)
         self.assertIn("fd=20261001", send)
         self.assertIn("td=20261026", send)
-        self.assertTrue(all("ref=REF123" in u for u in opener.urls[1:]))
+        # IBKR takes the reference in q on GetStatement too;
+        # a ref= parameter is ignored and answered 1020
+        # (proven live 2026-10-27 against flex_pull 0.2.0,
+        # which this assertion originally encoded wrongly).
+        self.assertTrue(all("q=REF123" in u for u in opener.urls[1:]))
+        self.assertTrue(all("ref=" not in u for u in opener.urls[1:]))
 
     def test_send_request_failure_surfaces(self):
         fail = ("<FlexStatementResponse><Status>Fail</Status>"
@@ -272,6 +277,64 @@ FLEX_MINI = (
     "CurrencyPrimary,FXRateToBase,Symbol,Description,Date/Time,"
     "Amount,Type\n"
 )
+
+
+class _FakeResponse:
+    def __init__(self, body):
+        self._body = body.encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+class _FakeOpener:
+    """Scripts HTTP responses and records request URLs."""
+
+    def __init__(self, bodies):
+        self._bodies = list(bodies)
+        self.urls = []
+
+    def open(self, req, timeout=None):
+        self.urls.append(req.full_url)
+        return _FakeResponse(self._bodies.pop(0))
+
+
+SEND_OK = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    "<FlexStatementResponse><Status>Success</Status>"
+    "<ReferenceCode>REF123</ReferenceCode></FlexStatementResponse>")
+GENERATING = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    "<FlexStatementResponse><Status>Fail</Status>"
+    "<ErrorCode>1019</ErrorCode>"
+    "<ErrorMessage>Statement generation in progress"
+    "</ErrorMessage></FlexStatementResponse>")
+
+
+class RealClientTests(unittest.TestCase):
+    """The real FlexClient over a fake transport: the URL
+    contract is IBKR's, and 0.2.0 shipped q->ref wrong on
+    GetStatement (live error 1020) because only stub clients
+    were tested."""
+
+    def test_fetch_uses_q_for_reference_and_polls(self):
+        opener = _FakeOpener([SEND_OK, GENERATING, SAMPLE_CSV])
+        client = flex_pull.FlexClient("TOK999", opener=opener,
+                                      sleeper=lambda s: None)
+        body = client.fetch("1687614", date(2026, 10, 1),
+                            date(2026, 10, 26))
+        self.assertEqual(body, SAMPLE_CSV)
+        self.assertIn("q=1687614", opener.urls[0])
+        self.assertIn("fd=20261001", opener.urls[0])
+        for url in opener.urls[1:]:
+            self.assertIn("q=REF123", url)
+            self.assertNotIn("ref=", url)
 
 
 class ConvertModeTests(unittest.TestCase):
