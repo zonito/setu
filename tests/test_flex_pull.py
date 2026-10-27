@@ -354,7 +354,9 @@ class SendRetryTests(unittest.TestCase):
         body = client.fetch("1687614", date(2026, 10, 1),
                             date(2026, 10, 26), interval_s=20)
         self.assertEqual(body, SAMPLE_CSV)
-        self.assertEqual(sleeps, [20])
+        # Send retries are minutes-scale (5 min first), never
+        # the 20s statement-poll interval — 1025 taught that.
+        self.assertEqual(sleeps, [300])
 
     def test_send_1001_eventually_gives_up(self):
         opener = _FakeOpener([GEN_FAIL_1001])

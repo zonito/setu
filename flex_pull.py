@@ -55,11 +55,15 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-FLEX_PULL_VERSION = "0.2.2"
+FLEX_PULL_VERSION = "0.2.3"
 FLEX_BASE = ("https://ndcdyn.interactivebrokers.com"
              "/Universal/servlet/FlexStatementService")
 # IBKR error 1019: statement generation in progress — retryable.
 RETRYABLE_ERROR_CODES = {"1019"}
+
+# SendRequest retry schedule for IBKR error 1001 (seconds):
+# minutes-scale on purpose — see the note in FlexClient.fetch.
+SEND_RETRY_DELAYS_S = (300, 600, 900)
 DEFAULT_MAX_WAIT_S = 1800
 DEFAULT_INTERVAL_S = 20
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -195,21 +199,25 @@ class FlexClient:
               max_wait_s: int = DEFAULT_MAX_WAIT_S,
               interval_s: int = DEFAULT_INTERVAL_S) -> str:
         # 1001 ("could not be generated at this time, try
-        # again shortly") is IBKR-side and transient — seen
-        # live 2026-10-27 minutes after a prior SendRequest.
-        # Retry it on the poll interval inside the wait budget
-        # instead of failing the morning run.
+        # again shortly") is IBKR-side and transient — but
+        # "shortly" is minutes, not seconds: retrying every
+        # 20s (0.2.2) tripped IBKR's attempt limiter, error
+        # 1025, live 2026-10-27. Send retries therefore use
+        # a short, minutes-scale schedule (5, 10, 15 min —
+        # at most 4 attempts), and 1025 itself never retries.
         waited_send = 0
+        delays = list(SEND_RETRY_DELAYS_S)
         while True:
             try:
                 reference = self.send_request(query_id, from_date,
                                               to_date)
                 break
             except FlexError as exc:
-                if exc.code != "1001" or waited_send >= max_wait_s:
+                if (exc.code != "1001" or not delays
+                        or waited_send + delays[0] > max_wait_s):
                     raise
-                self._sleep(interval_s)
-                waited_send += interval_s
+                self._sleep(delays[0])
+                waited_send += delays.pop(0)
         # GetStatement takes the reference in q, like
         # SendRequest takes the query id — a "ref" parameter
         # is ignored and IBKR answers 1020 (seen live
