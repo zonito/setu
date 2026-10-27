@@ -470,6 +470,112 @@ retained parent fill (the dependency has resolved); in simulate
 nothing is consumed. A FILLED parent in a mock poll evaluates
 identically but transmits nothing.
 
+### Web API cancel channel (setu-exec v0.8.0)
+
+Some working orders can never be cancelled over the socket API:
+orders placed through Client Portal report `orderId 0` even on a
+bound client-0 session (Class B), so no socket cancel can address
+them — the 2026-10-27 IREN 40P orphan failed exactly this way.
+v0.8 adds a second cancel route for those rows only. The socket
+route is unchanged and always tried first; the web route engages
+only when (a) all the shared cancel gates passed, (b) the target
+still has no session order id, and (c) Web API credentials exist
+for the account. Without credentials the row fails with the
+legacy reason, byte-identical.
+
+How it works:
+
+- Auth is IBKR's **OAuth 1.0a self-service** for the Web API
+  (api.ibkr.com/v1/api) — the OAuth 2.0 flow is institutional
+  onboarding only. The executor mints a live session token
+  (RSA-SHA256 request signature + Diffie-Hellman exchange,
+  verified against IBKR's published worked example), opens a
+  brokerage session, and identity-matches the target in
+  `GET /iserver/account/orders` on order id, account, conid,
+  side, working status, unfilled state, quantity and limit
+  price. Any mismatch refuses (`web_identity`); a session
+  failure refuses (`web_session`). Nothing is deleted on a
+  partial match.
+- The cancel itself is
+  `DELETE /iserver/account/{accountId}/order/{orderId}`. The
+  DELETE is the row's one runaway-brake transmission, counted
+  when sent. The 200 acknowledgement never proves anything:
+  `executed` is reported only after the target is absent from
+  BOTH the Web API live-orders list and the Setu socket feed on
+  fresh reads. Otherwise the row stays tracked as unverified
+  for `reconcile_cancels`, exactly like the socket route.
+- Cancel streak and terminal semantics are shared with the
+  socket route, so Phase 2 auto-approval confidence carries
+  over unchanged.
+- Rows may carry `web_order_id` (used when present; the feed's
+  perm id and the Web API order id are the same number) and a
+  `cancel_route` hint (informational; the executor decides the
+  route at execution from the live target).
+- Credentials are per account, live only on the machine that
+  runs that account's executor, and are never in this repo:
+  `~/.setu/webapi-<account>.json` plus the two PEM files it
+  points at, all mode 600. Live mode refuses group/other-
+  writable credential files, like `executor.json`. The JSON:
+
+  ```json
+  {
+    "consumer_key": "your 9-char consumer key",
+    "access_token": "from the OAuth portal",
+    "access_token_secret_hex": "decrypted secret, hex-encoded",
+    "signature_key_path": "/Users/you/.setu/private_signature.pem",
+    "dhparam_path": "/Users/you/.setu/dhparam.pem",
+    "realm": "limited_poa"
+  }
+  ```
+
+Registration (once per account, by the account holder):
+
+1. Open the OAuth Self-Service Portal
+   (https://ndcdyn.interactivebrokers.com/sso/Login?action=OAUTH&RL=1&ip2loc=US),
+   log in with the account's API username, choose a consumer key.
+2. Generate two 2048-bit RSA keypairs (signature + encryption)
+   and DH parameters, and upload the public halves:
+
+   ```
+   openssl genrsa -out private_signature.pem 2048
+   openssl rsa -in private_signature.pem -pubout -out public_signature.pem
+   openssl genrsa -out private_encryption.pem 2048
+   openssl rsa -in private_encryption.pem -pubout -out public_encryption.pem
+   openssl dhparam -out dhparam.pem 2048
+   ```
+
+3. In the portal, generate the access token. The portal returns
+   an **encrypted** access token secret; decrypt it once with
+   the private encryption key and hex-encode the result into
+   `access_token_secret_hex`:
+
+   ```
+   # paste the portal's encrypted secret (base64) into secret.b64, then:
+   base64 -d secret.b64 | openssl pkeyutl -decrypt \
+     -inkey private_encryption.pem -pkeyopt rsa_padding_mode:pkcs1 \
+     | xxd -p -c 256
+   ```
+
+4. Write `~/.setu/webapi-<account>.json` as above, `chmod 600`
+   the JSON and both private PEMs, and keep
+   `private_encryption.pem` somewhere safe (setup only; the
+   executor never reads it).
+5. **New consumer keys activate only during IBKR's daily server
+   maintenance** — register one day, first use the next.
+
+Phase 0 proof (read-only) before any live web cancel:
+`webapi_probe.py` (installed beside the executor) authenticates,
+opens a session and lists live orders, flagging `--target`:
+
+```
+~/.setu/venv/bin/python ~/.setu/webapi_probe.py \
+  --account U19377323 --target 829711680
+```
+
+It contains no cancel code path. Roll-out: Phase 0 probe →
+Phase 1 simulate rows prove the route read-only → Phase 2 live
+drill on a known orphan → Phase 3 the second account.
+
 ## Config — `~/.setu/config.json`
 
 | Key | Meaning |

@@ -31,6 +31,7 @@ mkdir -p "$SETU_HOME/logs" "$HOME/Library/LaunchAgents"
 
 echo "1/3 Program"
 cp setu_exec.py "$SETU_HOME/setu_exec.py"
+cp webapi_probe.py "$SETU_HOME/webapi_probe.py"
 
 echo "2/3 Executor config"
 if [ -f "$SETU_HOME/executor.json" ]; then

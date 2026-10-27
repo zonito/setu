@@ -408,6 +408,57 @@ v0.2.2 (2026-10-23):
     connectivity errors are logged once per run with a summary
     count instead of one line per cycle.
 
+v0.8.0 (2026-10-27): a second cancel route, web — the IBKR Web
+  API (OAuth 1.0a self-service) channel for Class B orders.
+  Some working orders never take a socket session id (Client
+  Portal orders are the proven class: IREN 261030P00040000 BUY
+  10 @ 0.60, perm 829711680, reported orderId 0 even on a bound
+  client-0 view, and its approved cancel row FAILED closed on
+  2026-10-27). No socket cancel can address such an order, and
+  reqGlobalCancel stays forbidden. The Web API cancels any
+  order in the account by its web order id:
+  DELETE /v1/api/iserver/account/{accountId}/order/{orderId}
+  against https://api.ibkr.com/v1/api, authenticated by OAuth
+  1.0a (self-service portal credentials: consumer key, access
+  token, RSA signature key, DH parameters; a live session token
+  is minted per attempt and verified against the server-returned
+  signature before any use). Route selection happens at
+  execution time, per row: the socket route runs EXACTLY as
+  before whenever the target resolves any session id; the web
+  route engages only at the point the socket route proves no
+  session id exists (the old terminal failure). It inherits
+  every cancel gate already passed by then (arm, kill switch,
+  fresh socket reads, identity, unfilled, orphan premise,
+  own-order exclusion) and adds one of its own: the target must
+  identity-match an entry in the Web API live-orders list (web
+  order id, conid, account, side, quantity, limit price,
+  working status, unfilled) or the row refuses at gate
+  web_identity with NO DELETE sent. The DELETE counts as a
+  runaway-brake transmission at the moment it is sent; the
+  shared brake check has already run, so at most one web
+  cancel transmits per poll cycle. Verification decides, as
+  with socket cancels: the row counts EXECUTED only when the
+  target is absent from BOTH the Web API live-orders list and
+  a fresh socket read; a submitted ack alone never marks it.
+  Credentials live in webapi-<account_id>.json beside the
+  executor config (consumer key, access token, the DECRYPTED
+  access token secret as hex, and paths to the RSA signature
+  key and DH parameter files); an absent file simply leaves
+  the web route unavailable and the old failure stands, a
+  present-but-broken file fails the row closed at gate
+  web_credentials with the precise reason. In live mode the
+  credential and key files must not be group/other-writable.
+  Pure stdlib implementation (urllib over an explicit no-proxy
+  opener — the v0.2.2 proxy lesson applies to api.ibkr.com
+  too — plus a minimal DER reader and RSA via pow()); the
+  crypto is pinned byte-exact to the worked example in IBKR's
+  "OAuth at Interactive Brokers" (request-token signature
+  section 7.2, live-session-token signature 7.4, HMAC resource
+  signature 7.5) by tests/test_web_cancel.py. webapi_probe.py
+  is the read-only Phase 0 coexistence proof: it mints a
+  session and prints the live-orders list; it has no code path
+  that can send a DELETE.
+
 Config: account, Kubera and Gateway settings come from the same
 ~/.setu/config.json Setu uses (read, never written by this program).
 Mode and executor knobs live in executor.json beside it. The ingest
@@ -421,20 +472,26 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
 import shutil
 import stat
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -453,6 +510,13 @@ BENIGN_ERRORS = {2104, 2106, 2107, 2158, 2119}
 # information the cancel paths must classify — and only when it
 # is tied to the target order id.
 CANCEL_CONFIRMED_ERROR_CODE = 202
+WEB_API_BASE = "https://api.ibkr.com/v1/api"
+WEB_API_TIMEOUT_SECONDS = 20.0
+# Post-DELETE verification (v0.8): poll both order views until
+# the target is absent from both, else take the unverified path
+# (the row stays tracked; reconcile_cancels resolves it).
+WEB_VERIFY_ATTEMPTS = 9
+WEB_VERIFY_INTERVAL_SECONDS = 3.0
 UNSET = 1.0e100  # ibapi marks unset doubles with a huge sentinel
 
 
@@ -2512,6 +2576,14 @@ def normalise_row(raw: dict) -> dict:
         "target_action": str(raw.get("target_action") or ""),
         "target_quantity": to_float(raw.get("target_quantity")),
         "target_limit_price": to_float(raw.get("target_limit_price")),
+        # v0.8: the Web API order id for the web cancel route.
+        # Kubera may stamp it explicitly; absent = the executor
+        # uses target_order_id (Phase 0 proved the feed id is
+        # the same number). cancel_route is Kubera's raise-time
+        # stamp, carried for event detail only — execution-time
+        # route selection stays socket-first regardless.
+        "web_order_id": str(raw.get("web_order_id") or ""),
+        "cancel_route": str(raw.get("cancel_route") or "").strip().lower(),
         "reason": str(raw.get("reason") or ""),
         "source": str(raw.get("source") or ""),
         "approval_mode": str(raw.get("approval_mode") or ""),
@@ -3524,6 +3596,552 @@ class ExecGateway:
 
 
 # ---------------------------------------------------------------------------
+# IBKR Web API (OAuth 1.0a) — the web cancel route (v0.8)
+#
+# Standard library only. RSA is RSASSA-PKCS1-v1_5 via pow() over
+# integers parsed from the PEM with the minimal DER reader below;
+# DH and both HMACs are hashlib/hmac. Every crypto shape is pinned
+# byte-exact to IBKR's published worked example ("OAuth at
+# Interactive Brokers", sections 7.2 / 7.4 / 7.5) by
+# tests/test_web_cancel.py.
+# ---------------------------------------------------------------------------
+
+class WebApiError(Exception):
+    """Any Web API failure. Callers fail the row closed; the
+    message is the precise reason surfaced in the event."""
+
+
+def _der_read_length(buf: bytes, i: int) -> tuple[int, int]:
+    first = buf[i]
+    i += 1
+    if first < 0x80:
+        return first, i
+    count = first & 0x7F
+    if count == 0 or i + count > len(buf):
+        raise WebApiError("invalid DER length")
+    return int.from_bytes(buf[i:i + count], "big"), i + count
+
+
+def _der_read_tlv(buf: bytes, i: int) -> tuple[int, bytes, int]:
+    if i >= len(buf):
+        raise WebApiError("truncated DER")
+    tag = buf[i]
+    i += 1
+    length, i = _der_read_length(buf, i)
+    if i + length > len(buf):
+        raise WebApiError("truncated DER value")
+    return tag, buf[i:i + length], i + length
+
+
+def _der_top_sequence(der: bytes) -> bytes:
+    tag, body, end = _der_read_tlv(der, 0)
+    if tag != 0x30 or end != len(der):
+        raise WebApiError("expected a single DER SEQUENCE")
+    return body
+
+
+def _der_integers(body: bytes) -> list[int]:
+    values = []
+    i = 0
+    while i < len(body):
+        tag, value, i = _der_read_tlv(body, i)
+        if tag != 0x02:
+            raise WebApiError("expected a DER INTEGER")
+        values.append(int.from_bytes(value, "big"))
+    return values
+
+
+def _pem_der(pem_text: str, what: str) -> bytes:
+    body = "".join(ln.strip() for ln in pem_text.splitlines()
+                   if ln.strip() and not ln.startswith("-----"))
+    try:
+        return base64.b64decode(body, validate=True)
+    except Exception:
+        raise WebApiError(f"{what}: PEM body is not valid base64")
+
+
+def parse_rsa_private_key(pem_text: str) -> tuple[int, int, int]:
+    """(modulus, public exponent, private exponent) from a PEM RSA
+    private key — PKCS#8 ("BEGIN PRIVATE KEY", what OpenSSL 3
+    genrsa writes) or PKCS#1 ("BEGIN RSA PRIVATE KEY", what
+    LibreSSL on macOS writes)."""
+    body = _der_top_sequence(_pem_der(pem_text, "signature key"))
+    tag, _version, pos = _der_read_tlv(body, 0)
+    if tag != 0x02:
+        raise WebApiError("signature key: unexpected DER shape")
+    tag2, second, pos2 = _der_read_tlv(body, pos)
+    if tag2 == 0x30:
+        # PKCS#8: algorithm identifier, then the key OCTET STRING.
+        tag3, third, _ = _der_read_tlv(body, pos2)
+        if tag3 != 0x04:
+            raise WebApiError("signature key: unexpected PKCS#8 shape")
+        ints = _der_integers(_der_top_sequence(third))
+    elif tag2 == 0x02:
+        # PKCS#1: a bare sequence of INTEGERs.
+        ints = _der_integers(body)
+    else:
+        raise WebApiError("signature key: unexpected DER shape")
+    if len(ints) < 4:
+        raise WebApiError("signature key: too few RSA integers")
+    return ints[1], ints[2], ints[3]
+
+
+def parse_dh_parameters(pem_text: str) -> tuple[int, int]:
+    """(prime, generator) from a PEM DH parameter file
+    ("BEGIN DH PARAMETERS": a sequence of two INTEGERs)."""
+    ints = _der_integers(_der_top_sequence(
+        _pem_der(pem_text, "DH parameters")))
+    if len(ints) < 2:
+        raise WebApiError("DH parameters: expected prime and generator")
+    return ints[0], ints[1]
+
+
+_SHA256_DIGEST_INFO_PREFIX = bytes.fromhex(
+    "3031300d060960864801650304020105000420")
+
+
+def rsa_sha256_sign(data: bytes, modulus: int,
+                    private_exponent: int) -> str:
+    """RSASSA-PKCS1-v1_5 with SHA-256; base64 of the signature."""
+    key_bytes = (modulus.bit_length() + 7) // 8
+    digest_info = _SHA256_DIGEST_INFO_PREFIX + hashlib.sha256(data).digest()
+    if key_bytes < len(digest_info) + 11:
+        raise WebApiError("signature key too small for RSA-SHA256")
+    encoded = (b"\x00\x01" + b"\xff" * (key_bytes - len(digest_info) - 3)
+               + b"\x00" + digest_info)
+    signature = pow(int.from_bytes(encoded, "big"),
+                    private_exponent, modulus)
+    return base64.b64encode(
+        signature.to_bytes(key_bytes, "big")).decode("ascii")
+
+
+def _oauth_encode(value) -> str:
+    """RFC 3986 percent-encoding, as OAuth 1.0a section 9 requires."""
+    return urllib.parse.quote(str(value), safe="")
+
+
+def oauth_signature_base_string(method: str, url: str,
+                                params: dict) -> str:
+    pairs = sorted((_oauth_encode(k), _oauth_encode(v))
+                   for k, v in params.items())
+    param_string = "&".join(f"{k}={v}" for k, v in pairs)
+    return "&".join((method.upper(), _oauth_encode(url),
+                     _oauth_encode(param_string)))
+
+
+def oauth_authorization_header(params: dict, realm: str) -> str:
+    parts = [f'realm="{_oauth_encode(realm)}"']
+    for key in sorted(params):
+        parts.append(f'{key}="{_oauth_encode(params[key])}"')
+    return "OAuth " + ", ".join(parts)
+
+
+def _java_bigint_bytes(value: int) -> bytes:
+    """Java BigInteger.toByteArray() semantics, which IBKR's
+    server-side DH arithmetic uses: minimal big-endian two's
+    complement — a leading zero byte when the top bit is set."""
+    if value == 0:
+        return b"\x00"
+    raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+    if raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return raw
+
+
+class WebApiCredentials:
+    """One account's OAuth 1.0a self-service credential set."""
+
+    def __init__(self, consumer_key: str, access_token: str,
+                 access_token_secret: bytes, rsa_modulus: int,
+                 rsa_private_exponent: int, dh_prime: int,
+                 dh_generator: int, realm: str):
+        self.consumer_key = consumer_key
+        self.access_token = access_token
+        self.access_token_secret = access_token_secret
+        self.rsa_modulus = rsa_modulus
+        self.rsa_private_exponent = rsa_private_exponent
+        self.dh_prime = dh_prime
+        self.dh_generator = dh_generator
+        self.realm = realm
+
+
+def webapi_credentials_path(cfg: dict, account_id: str) -> Path:
+    return Path(cfg["_config_dir"]) / f"webapi-{account_id}.json"
+
+
+def _check_not_group_other_writable(path: Path, what: str) -> None:
+    try:
+        mode = path.stat().st_mode
+    except OSError as exc:
+        raise WebApiError(f"{what}: cannot stat {path}: {exc}")
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise WebApiError(f"{what} ({path}) is group/other-writable; "
+                          f"refusing in live mode")
+
+
+def load_webapi_credentials(cfg: dict, account_id: str,
+                            enforce_permissions: bool):
+    """The account's WebApiCredentials, or None when no credential
+    file exists (the web route is simply unavailable — the
+    historical socket behaviour stands). A file that exists but
+    cannot be used raises WebApiError: a broken credential set
+    must fail closed and SAY so, never silently degrade into the
+    socket failure this channel exists to fix."""
+    path = webapi_credentials_path(cfg, account_id)
+    if not path.exists():
+        return None
+    if enforce_permissions:
+        _check_not_group_other_writable(path, "Web API credentials")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise WebApiError(f"Web API credentials unreadable: {exc}")
+    if not isinstance(data, dict):
+        raise WebApiError("Web API credentials: not a JSON object")
+
+    def _field(name: str) -> str:
+        value = data.get(name)
+        if not value:
+            raise WebApiError(f"Web API credentials: missing {name}")
+        return str(value)
+
+    try:
+        secret = bytes.fromhex(_field("access_token_secret_hex"))
+    except ValueError:
+        raise WebApiError("Web API credentials: "
+                          "access_token_secret_hex is not hex")
+
+    def _read_key_file(field_name: str) -> str:
+        key_path = Path(_field(field_name)).expanduser()
+        if enforce_permissions:
+            _check_not_group_other_writable(key_path, field_name)
+        try:
+            return key_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise WebApiError(f"Web API credentials: cannot read "
+                              f"{field_name} ({key_path}): {exc}")
+
+    modulus, _e, private = parse_rsa_private_key(
+        _read_key_file("signature_key_path"))
+    prime, generator = parse_dh_parameters(_read_key_file("dhparam_path"))
+    return WebApiCredentials(
+        consumer_key=_field("consumer_key"),
+        access_token=_field("access_token"),
+        access_token_secret=secret,
+        rsa_modulus=modulus, rsa_private_exponent=private,
+        dh_prime=prime, dh_generator=generator,
+        realm=str(data.get("realm") or "limited_poa"))
+
+
+def _webapi_parse_json(raw: str):
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+def _webapi_payload_snippet(payload) -> str:
+    text = (payload if isinstance(payload, str)
+            else json.dumps(payload, default=str))
+    return text[:200]
+
+
+def _webapi_default_transport(method: str, url: str, headers: dict,
+                              body: bytes | None):
+    """urllib over an explicit no-proxy opener (the v0.2.2 lesson:
+    proxy environment variables must never fence api.ibkr.com).
+    Returns (status, parsed JSON or raw text); transport-level
+    failures raise WebApiError, HTTP errors return their status
+    and body for the caller to classify."""
+    request = urllib.request.Request(url, data=body, method=method)
+    for key, value in headers.items():
+        request.add_header(key, value)
+    request.add_header("User-Agent", f"setu-exec/{VERSION}")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request,
+                         timeout=WEB_API_TIMEOUT_SECONDS) as response:
+            raw = response.read().decode("utf-8", "replace")
+            return response.status, _webapi_parse_json(raw)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace") if exc.fp else ""
+        return exc.code, _webapi_parse_json(raw)
+    except (urllib.error.URLError, OSError) as exc:
+        raise WebApiError(f"Web API transport failed: {exc}")
+
+
+class WebApiClient:
+    """One short-lived OAuth session against api.ibkr.com.
+
+    A fresh client is built per cancel attempt: minting a live
+    session token is one RSA-signed POST, cheap next to the gates
+    around it, and a short-lived session can never go stale
+    between poll cycles. The transport is injectable for tests."""
+
+    def __init__(self, creds: WebApiCredentials, transport=None,
+                 nonce_source=None, dh_random_source=None):
+        self.creds = creds
+        self._transport = transport or _webapi_default_transport
+        self._nonce_source = nonce_source or (lambda: secrets.token_hex(10))
+        self._dh_random_source = (dh_random_source
+                                  or (lambda: secrets.randbits(256)))
+        self._lst: bytes | None = None
+        self._timestamp_floor = 0
+
+    def _next_timestamp(self) -> str:
+        now = int(time.time())
+        if now <= self._timestamp_floor:
+            now = self._timestamp_floor + 1
+        self._timestamp_floor = now
+        return str(now)
+
+    # -- session establishment (OAuth 1.0a + IBKR's DH step) --------
+    def mint_live_session_token(self) -> bytes:
+        creds = self.creds
+        a = self._dh_random_source()
+        challenge = pow(creds.dh_generator, a, creds.dh_prime)
+        params = {
+            "diffie_hellman_challenge": format(challenge, "x"),
+            "oauth_consumer_key": creds.consumer_key,
+            "oauth_nonce": self._nonce_source(),
+            "oauth_signature_method": "RSA-SHA256",
+            "oauth_timestamp": self._next_timestamp(),
+            "oauth_token": creds.access_token,
+        }
+        url = WEB_API_BASE + "/oauth/live_session_token"
+        base = oauth_signature_base_string("POST", url, params)
+        # IBKR's variation (section 5 of their OAuth document):
+        # the hex of the decrypted access token secret is prepended
+        # to the signature base string before RSA signing.
+        signed = (creds.access_token_secret.hex() + base).encode("utf-8")
+        params["oauth_signature"] = rsa_sha256_sign(
+            signed, creds.rsa_modulus, creds.rsa_private_exponent)
+        headers = {"Authorization": oauth_authorization_header(
+            params, creds.realm)}
+        status, payload = self._transport("POST", url, headers, None)
+        if status != 200 or not isinstance(payload, dict):
+            raise WebApiError(
+                f"live session token request failed (HTTP {status}): "
+                f"{_webapi_payload_snippet(payload)}")
+        try:
+            dh_response = int(str(payload["diffie_hellman_response"]), 16)
+            server_signature = str(
+                payload["live_session_token_signature"]).lower()
+        except (KeyError, ValueError) as exc:
+            raise WebApiError(
+                f"live session token response malformed: {exc}")
+        shared = pow(dh_response, a, creds.dh_prime)
+        lst = hmac.new(_java_bigint_bytes(shared),
+                       creds.access_token_secret, hashlib.sha1).digest()
+        expected = hmac.new(lst, creds.consumer_key.encode("utf-8"),
+                            hashlib.sha1).hexdigest()
+        if not hmac.compare_digest(expected, server_signature):
+            raise WebApiError(
+                "live session token signature mismatch: the locally "
+                "derived token does not match IBKR's signature (the "
+                "DH parameters or access token secret are wrong)")
+        self._lst = lst
+        return lst
+
+    # -- signed resource requests ------------------------------------
+    def _signed_headers(self, method: str, base_url: str,
+                        query: dict | None) -> dict:
+        if self._lst is None:
+            self.mint_live_session_token()
+        params = {
+            "oauth_consumer_key": self.creds.consumer_key,
+            "oauth_nonce": self._nonce_source(),
+            "oauth_signature_method": "HMAC-SHA256",
+            "oauth_timestamp": self._next_timestamp(),
+            "oauth_token": self.creds.access_token,
+        }
+        signed_params = dict(params)
+        if query:
+            signed_params.update({k: str(v) for k, v in query.items()})
+        base = oauth_signature_base_string(method, base_url, signed_params)
+        params["oauth_signature"] = base64.b64encode(hmac.new(
+            self._lst, base.encode("utf-8"), hashlib.sha256).digest()
+        ).decode("ascii")
+        return {"Authorization": oauth_authorization_header(
+            params, self.creds.realm)}
+
+    def request(self, method: str, path: str, json_body=None,
+                query: dict | None = None):
+        base_url = WEB_API_BASE + path
+        headers = self._signed_headers(method, base_url, query)
+        url = base_url
+        if query:
+            url = base_url + "?" + urllib.parse.urlencode(query)
+        body = None
+        if json_body is not None:
+            body = json.dumps(json_body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        return self._transport(method, url, headers, body)
+
+    def _request_or_raise(self, method: str, path: str, json_body=None,
+                          query: dict | None = None):
+        status, payload = self.request(method, path, json_body, query)
+        if status < 200 or status >= 300:
+            raise WebApiError(
+                f"{method} {path} failed (HTTP {status}): "
+                f"{_webapi_payload_snippet(payload)}")
+        if isinstance(payload, dict) and payload.get("error"):
+            raise WebApiError(
+                f"{method} {path} returned an error: "
+                f"{_webapi_payload_snippet(payload)}")
+        return payload
+
+    # -- the endpoints the cancel channel uses ------------------------
+    def init_brokerage_session(self) -> dict:
+        payload = self._request_or_raise(
+            "POST", "/iserver/auth/ssodh/init",
+            json_body={"publish": True, "compete": True})
+        return payload if isinstance(payload, dict) else {}
+
+    def auth_status(self) -> dict:
+        payload = self._request_or_raise("POST", "/iserver/auth/status")
+        return payload if isinstance(payload, dict) else {}
+
+    def session_accounts(self) -> list:
+        payload = self._request_or_raise("GET", "/iserver/accounts")
+        if isinstance(payload, dict):
+            accounts = payload.get("accounts")
+            if isinstance(accounts, list):
+                return accounts
+        return []
+
+    def live_orders(self) -> list[dict]:
+        payload = self._request_or_raise("GET", "/iserver/account/orders")
+        if isinstance(payload, dict):
+            orders = payload.get("orders")
+            if isinstance(orders, list):
+                return [o for o in orders if isinstance(o, dict)]
+        if isinstance(payload, list):
+            return [o for o in payload if isinstance(o, dict)]
+        raise WebApiError("live orders response carries no orders list")
+
+    def cancel_order(self, account_id: str, web_order_id: str) -> dict:
+        payload = self._request_or_raise(
+            "DELETE", f"/iserver/account/{account_id}/order/{web_order_id}")
+        return payload if isinstance(payload, dict) else {}
+
+
+def build_webapi_client(creds: WebApiCredentials) -> WebApiClient:
+    """Factory seam: tests substitute a fake client here."""
+    return WebApiClient(creds)
+
+
+_WEB_WORKING_STATUSES = {"PreSubmitted", "Submitted", "PendingSubmit",
+                         "PendingCancel", "ApiPending"}
+_WEB_TERMINAL_STATUSES = {"Filled", "Cancelled", "ApiCancelled",
+                          "Inactive"}
+
+
+def _web_order_quantity(entry: dict):
+    """(filled, total) from a live-orders entry, or None when the
+    payload shape does not say. sizeAndFills is "filled/total" in
+    the current Web API payload; explicit fields win."""
+    total = to_float(entry.get("totalSize"))
+    if total is None:
+        total = to_float(entry.get("quantity"))
+    filled = to_float(entry.get("filledQuantity"))
+    if filled is None:
+        filled = to_float(entry.get("filled"))
+    size_and_fills = entry.get("sizeAndFills")
+    if isinstance(size_and_fills, str) and "/" in size_and_fills:
+        left, _, right = size_and_fills.partition("/")
+        if filled is None:
+            filled = to_float(left.strip())
+        if total is None:
+            total = to_float(right.strip())
+    if filled is None or total is None:
+        return None
+    return filled, total
+
+
+def _web_order_limit(entry: dict):
+    limit = to_float(entry.get("limitPrice"))
+    if limit is not None:
+        return limit
+    limit = to_float(entry.get("price"))
+    if limit is not None:
+        return limit
+    desc = str(entry.get("orderDesc") or "")
+    match = re.search(r"LMT\s+([0-9]+(?:\.[0-9]+)?)", desc)
+    if match:
+        return to_float(match.group(1))
+    return None
+
+
+def match_web_order(row: dict, orders: list[dict], account_id: str):
+    """Identity-match a cancel row's target in the Web API
+    live-orders list. Returns (entry, None) on a full match, else
+    (None, reason) — the caller refuses with the reason and sends
+    NO DELETE. Strict on purpose: this list is the only identity
+    evidence the web route has, and a partial match is no match."""
+    web_order_id = str(row.get("web_order_id")
+                       or row.get("target_order_id") or "")
+    candidates = [o for o in orders
+                  if str(o.get("orderId") or "") == web_order_id]
+    if not candidates:
+        return None, (f"web order {web_order_id} is not in the Web API "
+                      f"live-orders list ({len(orders)} orders listed)")
+    if len(candidates) > 1:
+        return None, (f"web order {web_order_id} appears "
+                      f"{len(candidates)} times in the Web API list; "
+                      f"ambiguous, refusing")
+    entry = candidates[0]
+
+    def _mismatch(field, expected, actual):
+        return (f"web identity mismatch on {field}: row says "
+                f"{expected}, Web API says {actual}")
+
+    acct = (entry.get("acctId") or entry.get("accountId")
+            or entry.get("account"))
+    if acct and str(acct) != account_id:
+        return None, _mismatch("account", account_id, acct)
+    if int(to_float(entry.get("conid")) or 0) != int(row.get("con_id") or 0):
+        return None, _mismatch("conid", row.get("con_id"),
+                               entry.get("conid"))
+    side = str(entry.get("side") or "").upper()
+    if not side:
+        desc = str(entry.get("orderDesc") or "").upper()
+        side = desc.split(" ", 1)[0] if desc else ""
+    if side != str(row.get("target_action") or "").upper():
+        return None, _mismatch("side", row.get("target_action"),
+                               side or entry.get("side"))
+    status = str(entry.get("status") or "")
+    if status in _WEB_TERMINAL_STATUSES:
+        return None, (f"web order {web_order_id} is {status} in the "
+                      f"Web API list; no longer a working order")
+    if status not in _WEB_WORKING_STATUSES:
+        return None, (f"web order {web_order_id} carries unrecognised "
+                      f"status {status!r} in the Web API list; "
+                      f"refusing to guess")
+    quantity = _web_order_quantity(entry)
+    if quantity is None:
+        return None, ("web identity incomplete: the Web API entry "
+                      "does not state filled/total quantities")
+    filled, total = quantity
+    if filled > 0:
+        return None, (f"web order {web_order_id} is partially filled "
+                      f"({filled:g}/{total:g}); the cancel premise "
+                      f"requires unfilled")
+    if total != float(row.get("target_quantity") or 0):
+        return None, _mismatch("quantity", row.get("target_quantity"),
+                               total)
+    limit = _web_order_limit(entry)
+    if limit is None:
+        return None, ("web identity incomplete: the Web API entry "
+                      "does not state a limit price")
+    if round(limit, 2) != round(float(row.get("target_limit_price")
+                                     or 0), 2):
+        return None, _mismatch("limit price",
+                               row.get("target_limit_price"), limit)
+    return entry, None
+
+
+# ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
 
@@ -3536,6 +4154,11 @@ class Executor:
         self.kubera = kubera
         self.gateway = gateway
         self.tracker = tracker if tracker is not None else PlacedTracker(cfg)
+        # v0.8: web-route post-DELETE verification knobs (instance
+        # attributes so tests can shrink them; production values
+        # are the module constants).
+        self._web_verify_attempts = WEB_VERIFY_ATTEMPTS
+        self._web_verify_interval = WEB_VERIFY_INTERVAL_SECONDS
         self._noted: set[str] = set()
         self._last_kill: bool | None = None  # kill state as last read
 
@@ -3796,11 +4419,15 @@ class Executor:
                 # Pushover at transmit time is the surface).
                 continue
             if rec.get("transmitted"):
-                self._report(row_id, "executed", {
+                executed_detail = {
                     "target_order_id": rec.get("target_order_id"),
                     "perm_id": rec.get("perm_id"),
                     "recovered": True,
-                    "cancel_streak": self.tracker.cancel_streak + 1})
+                    "cancel_streak": self.tracker.cancel_streak + 1}
+                if rec.get("route"):
+                    # v0.8: a web-route cancel recovered here.
+                    executed_detail["route"] = rec["route"]
+                self._report(row_id, "executed", executed_detail)
                 self.tracker.note_cancel_result(True)
                 log(f"CANCEL EXECUTED (recovered) row {row_id} — target "
                     f"{rec.get('target_order_id')} absent from live orders")
@@ -3972,6 +4599,178 @@ class Executor:
         self.tracker.note_cancel_result(False)
         self.tracker.drop_cancel(row["id"])
 
+    # -- web cancel route (v0.8) -------------------------------------------
+    def _web_client(self):
+        """(client, None) when the Web API channel is usable for
+        this account; (None, reason) when credentials exist but
+        are broken; (None, None) when no credentials exist at all
+        (the web route is simply unavailable). Building the client
+        performs NO network I/O; the session mints lazily."""
+        try:
+            creds = load_webapi_credentials(
+                self.cfg, self.account,
+                enforce_permissions=(self.mode == "live"))
+        except WebApiError as exc:
+            return None, str(exc)
+        if creds is None:
+            return None, None
+        return build_webapi_client(creds), None
+
+    def _web_credentials_present(self) -> bool:
+        return webapi_credentials_path(self.cfg, self.account).exists()
+
+    def _web_identity_match(self, row: dict, client):
+        """Mint the web session and identity-match the target in
+        the Web API live-orders list. Returns (entry, web_order_id,
+        failure): failure is a {gate, reason} detail for
+        _report_cancel_gate_failure, or None on a full match."""
+        web_order_id = str(row.get("web_order_id")
+                           or row.get("target_order_id") or "")
+        try:
+            client.init_brokerage_session()
+            orders = client.live_orders()
+        except WebApiError as exc:
+            return None, web_order_id, {
+                "gate": "web_session",
+                "reason": f"Web API session failed: {exc}"}
+        entry, reason = match_web_order(row, orders, self.account)
+        if entry is None:
+            return None, web_order_id, {
+                "gate": "web_identity", "reason": reason}
+        return entry, web_order_id, None
+
+    def _simulate_web_cancel(self, row: dict, order: dict,
+                             line: str) -> bool:
+        """Simulate-mode Class B handling: prove the web route
+        read-only (session + identity match, NO DELETE) and post
+        the would_execute the live run would act on. Returns False
+        when no credentials exist — the caller keeps today's
+        session-id failure."""
+        client, error = self._web_client()
+        if error is not None:
+            self._report_cancel_gate_failure(
+                row, {"gate": "web_credentials", "reason": error}, line)
+            return True
+        if client is None:
+            return False
+        entry, web_order_id, failure = self._web_identity_match(row, client)
+        if failure is not None:
+            self._report_cancel_gate_failure(row, failure, line)
+            return True
+        log(f"WOULD CANCEL {line} — route: web; DELETE "
+            f"/iserver/account/{self.account}/order/{web_order_id}; "
+            f"identity matched in the Web API live-orders list")
+        self._report(row["id"], "would_execute", {
+            "target_order_id": row["target_order_id"],
+            "web_order_id": web_order_id,
+            "route": "web",
+            "delete": (f"DELETE /v1/api/iserver/account/{self.account}"
+                       f"/order/{web_order_id}"),
+            "matched": {"conid": entry.get("conid"),
+                        "side": entry.get("side"),
+                        "status": entry.get("status"),
+                        "sizeAndFills": entry.get("sizeAndFills")},
+            "approval_mode": row.get("approval_mode") or "manual"})
+        return True
+
+    def _execute_web_cancel(self, row: dict, order: dict,
+                            line: str) -> None:
+        """Live web-route cancel of a Class B target. Reached only
+        after every shared cancel gate passed and the shared
+        runaway-brake check cleared: the socket route proved the
+        target has no session id, so the Web API is the only
+        channel that can address it. The DELETE is the one
+        transmission; verification (absent from BOTH order views)
+        decides the outcome exactly as on the socket route."""
+        client, error = self._web_client()
+        if error is not None:
+            self._report_cancel_gate_failure(
+                row, {"gate": "web_credentials", "reason": error}, line)
+            return
+        if client is None:
+            # Defensive: the caller checked presence first.
+            self._cancel_failed(row, line,
+                                "target order carries no session order id")
+            return
+        entry, web_order_id, failure = self._web_identity_match(row, client)
+        if failure is not None:
+            self._report_cancel_gate_failure(row, failure, line)
+            return
+
+        # Track BEFORE transmitting, exactly like the socket
+        # route, so a crash mid-cancel leaves a reconcilable trace.
+        self.tracker.add_cancel(row["id"], {
+            "target_order_id": row["target_order_id"],
+            "perm_id": order.get("perm_id"),
+            "con_id": row["con_id"],
+            "route": "web",
+            "transmitted": False,
+            "staged_at": datetime.now(LONDON).isoformat(timespec="seconds")})
+        self.tracker.save()
+
+        # The DELETE is the transmission: count it on the runaway
+        # brake at the moment it is sent, mirroring on_transmit.
+        self.tracker.record_transmission()
+        rec = self.tracker.get_cancel(row["id"])
+        if rec is not None:
+            rec["transmitted"] = True
+        self.tracker.save()
+        try:
+            ack = client.cancel_order(self.account, web_order_id)
+        except WebApiError as exc:
+            self._cancel_failed(row, line,
+                                f"Web API cancel failed: {exc}")
+            return
+        log(f"CANCEL SENT {line} — route: web, DELETE order "
+            f"{web_order_id} acknowledged: "
+            f"{_webapi_payload_snippet(ack)}")
+
+        # Verify: absent from BOTH views. The socket feed is the
+        # book of record for what is working; the Web API list is
+        # the channel's own view. Either one still showing the
+        # target (or a read failing) means NOT verified.
+        for attempt in range(self._web_verify_attempts):
+            if attempt:
+                time.sleep(self._web_verify_interval)
+            web_absent = None
+            try:
+                remaining = client.live_orders()
+                web_absent = all(
+                    str(o.get("orderId") or "") != web_order_id
+                    for o in remaining)
+            except WebApiError:
+                web_absent = None
+            fresh = self.gateway.fetch_open_orders()
+            socket_absent = (fresh is not None
+                             and find_target_order(row, fresh) is None)
+            if web_absent and socket_absent:
+                self._report(row["id"], "executed", {
+                    "target_order_id": row["target_order_id"],
+                    "web_order_id": web_order_id,
+                    "route": "web",
+                    "perm_id": order.get("perm_id"),
+                    "verified_absent": True,
+                    "verified_web_absent": True,
+                    "approval_mode": row.get("approval_mode") or "manual",
+                    "cancel_streak": self.tracker.cancel_streak + 1})
+                self.tracker.note_cancel_result(True)
+                self.tracker.drop_cancel(row["id"])
+                log(f"CANCELLED {line} — route: web; verified absent "
+                    f"from the Web API list and live orders")
+                self._notify("setu-exec: order cancelled",
+                             f"{self.account} cancel {line} — CANCELLED "
+                             f"via the Web API route and verified absent "
+                             f"from live orders")
+                return
+        log(f"CANCEL UNVERIFIED {line} — Web API acknowledged the "
+            f"DELETE but the target still appears in at least one "
+            f"order view; leaving tracked for reconciliation")
+        self._notify("setu-exec: cancel unverified",
+                     f"{self.account} cancel {line} — Web API "
+                     f"acknowledged the cancel but the order still "
+                     f"appears; NOT confirmed, tracked for "
+                     f"reconciliation")
+
     # -- one staged cancel row (v0.3) --------------------------------------
     def process_cancel_row(self, row: dict, positions: dict[int, dict] | None,
                            open_orders: list[dict] | None) -> None:
@@ -3999,10 +4798,16 @@ class Executor:
             order_id = int(order.get("order_id") or 0)
             if order_id == 0:
                 # The target never bound to a session order id, so
-                # a live cancel could not even be addressed
-                # (v0.3.2). Simulate surfaces that as a (never
+                # the socket route cannot address it. v0.8: when
+                # Web API credentials exist, simulate proves the
+                # web route read-only (session + identity match,
+                # no DELETE) and posts the would_execute live
+                # would act on. Without credentials, surface the
+                # socket verdict as before (v0.3.2): a (never
                 # terminal) gate verdict rather than a WOULD CANCEL
                 # claim live would fail to keep.
+                if self._simulate_web_cancel(row, order, line):
+                    return
                 self._report_cancel_gate_failure(row, {
                     "gate": "target",
                     "reason": "target order carries no session order id"},
@@ -4060,15 +4865,22 @@ class Executor:
 
         if int(order.get("order_id") or 0) == 0:
             # No session order id even in the bound view (v0.3.2):
-            # the cancel cannot be addressed, so nothing is
-            # transmitted — and the runaway brake must not count an
-            # attempt that never reached the Gateway. (v0.3.0
-            # recorded the transmission first and let cancel_order()
-            # refuse, so three such failures on 2026-10-25 consumed
-            # three daily slots with zero API calls.) Same failure
-            # surface as a Gateway refusal, minus the transmission.
-            self._cancel_failed(row, line,
-                                "target order carries no session order id")
+            # the socket route cannot address this order. v0.8:
+            # when Web API credentials exist for the account, the
+            # web route takes the row from here (it identity-
+            # matches on its own channel and counts its DELETE as
+            # the one transmission). Without credentials the
+            # historical failure stands, byte-identical — and, as
+            # before, the runaway brake must not count an attempt
+            # that never reached any API. (v0.3.0 recorded the
+            # transmission first and let cancel_order() refuse, so
+            # three such failures on 2026-10-25 consumed three
+            # daily slots with zero API calls.)
+            if self._web_credentials_present():
+                self._execute_web_cancel(row, order, line)
+            else:
+                self._cancel_failed(row, line,
+                                    "target order carries no session order id")
             return
 
         # Record the tracking row BEFORE transmitting so a crash

@@ -102,3 +102,38 @@ Notes:
   account's Master API Client ID in Gateway settings; without it
   the Gateway refuses (IB error 10147) and the row fails with that
   reason. Setup step, verified by the first live rehearsal.
+
+## 6. Web route addendum (setu-exec v0.8)
+
+- Some orders report no socket session id even on a bound
+  client-0 session (Client Portal orders; "Class B"). No socket
+  cancel can address them, and reqGlobalCancel stays forbidden.
+  For those rows only, the executor falls back to the IBKR Web
+  API: `DELETE /v1/api/iserver/account/{accountId}/order/{orderId}`
+  under OAuth 1.0a self-service credentials held per account on
+  the executor's machine (`~/.setu/webapi-<account>.json`, never
+  in Kubera, never in the repo).
+- Rows may carry `web_order_id` (the Web API order id; in
+  practice the same number as the feed's perm id, which remains
+  `target_order_id`) and a `cancel_route` stamp ("socket"/"web")
+  for display. The executor does not trust the stamp: the route
+  is decided at execution from the live target (session id
+  present → socket; absent + credentials present → web; absent +
+  no credentials → the legacy failure).
+- Route selection happens only after every existing gate in
+  sections 1–3 passes (arm, kill switch, fresh complete reads,
+  identity, unfilled, premise, own-order, runaway brake). The web
+  route then re-verifies identity on its own channel (order id,
+  account, conid, side, working status, unfilled, quantity,
+  limit) before any DELETE; a mismatch is a `web_identity`
+  refusal and no DELETE is sent.
+- The DELETE response is an acknowledgement, never proof:
+  `executed` requires the target absent from BOTH the Web API
+  live-orders list and the Setu feed on fresh reads. The DELETE
+  counts as the row's one brake transmission. Streak, terminal
+  states and the Closed-ledger rule are unchanged and shared
+  with the socket route; executed web cancels carry
+  `route: "web"` and `web_order_id` in their event detail.
+- Kubera needs no change to support the route: rows without
+  `web_order_id` work (the perm id is the fallback key), and a
+  scanner stamp, when present, is display-only.
