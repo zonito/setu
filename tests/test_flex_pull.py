@@ -337,6 +337,46 @@ class RealClientTests(unittest.TestCase):
             self.assertNotIn("ref=", url)
 
 
+GEN_FAIL_1001 = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    "<FlexStatementResponse><Status>Fail</Status>"
+    "<ErrorCode>1001</ErrorCode><ErrorMessage>Statement could "
+    "not be generated at this time. Please try again shortly."
+    "</ErrorMessage></FlexStatementResponse>")
+
+
+class SendRetryTests(unittest.TestCase):
+    def test_send_1001_is_retried(self):
+        opener = _FakeOpener([GEN_FAIL_1001, SEND_OK, SAMPLE_CSV])
+        sleeps = []
+        client = flex_pull.FlexClient("TOK999", opener=opener,
+                                      sleeper=sleeps.append)
+        body = client.fetch("1687614", date(2026, 10, 1),
+                            date(2026, 10, 26), interval_s=20)
+        self.assertEqual(body, SAMPLE_CSV)
+        self.assertEqual(sleeps, [20])
+
+    def test_send_1001_eventually_gives_up(self):
+        opener = _FakeOpener([GEN_FAIL_1001])
+        client = flex_pull.FlexClient("TOK999", opener=opener,
+                                      sleeper=lambda s: None)
+        with self.assertRaises(flex_pull.FlexError):
+            client.fetch("1687614", date(2026, 10, 1),
+                         date(2026, 10, 26), max_wait_s=0)
+
+    def test_send_other_errors_still_fail_fast(self):
+        fail = ('<?xml version="1.0" encoding="UTF-8"?>'
+                "<FlexStatementResponse><Status>Fail</Status>"
+                "<ErrorCode>1012</ErrorCode><ErrorMessage>Invalid "
+                "token</ErrorMessage></FlexStatementResponse>")
+        opener = _FakeOpener([fail])
+        client = flex_pull.FlexClient("TOK999", opener=opener,
+                                      sleeper=lambda s: None)
+        with self.assertRaises(flex_pull.FlexError):
+            client.fetch("1687614", date(2026, 10, 1),
+                         date(2026, 10, 26))
+
+
 class ConvertModeTests(unittest.TestCase):
     def make_job(self, tmp, convert=True):
         token_file = Path(tmp) / "token.txt"
