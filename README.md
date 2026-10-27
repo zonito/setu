@@ -639,6 +639,44 @@ list is authoritative and errors are never retried. A list that
 stays empty is returned as-is and the identity gate refuses, as
 before.
 
+## Flex morning fetch — `flex_pull.py`
+
+`flex_pull.py` retires the manual morning download: it pulls
+each account's **Transaction History** Flex statement
+(month-to-date through yesterday) from IBKR's Flex Web Service
+and writes it in place as `<MonYY>.csv` in the synced Drive
+folder (`Transactions/IBKR/<person>/`). Token-based — no login
+session, nothing competes with the Gateways. Install with
+`./flex-install.sh` (LaunchAgent `com.molang.flex-pull`,
+daily 06:45 local). A statement is written only after it
+validates as the Transaction History statement with data rows;
+the file it replaces is first copied to `~/.setu/flex-backups/`.
+
+One-time portal setup, per login:
+
+1. **Save the query.** Reports → Flex Queries → create an
+   Activity Flex Query containing the **Transaction History**
+   section with the fields the morning file carries (Date,
+   Account, Description, Transaction Type, Symbol, Quantity,
+   Price, Price Currency, Gross Amount, Commission, Net
+   Amount), format CSV. Note its Query ID.
+2. **Generate a token.** Reports → Flex Web Service (under
+   Settings in some layouts) → generate a token for the login.
+   The token is a credential: save it to
+   `~/.setu/flex-token-<account>.txt` (mode 600) on that
+   account's machine. Never in the repo, never in chat.
+3. **Configure.** Add a job per account to
+   `~/.setu/flex-pull.json`: name, account_id, query_id,
+   token_file, and output_dir (the local synced Drive folder
+   for that person).
+
+The fetcher passes explicit from/to dates (month start →
+yesterday) on every request, polls while IBKR answers 1019
+(statement generating, up to 30 min), and records each run in
+`~/.setu/flex-last-run.json`. Validate against the manual
+routine for a few mornings before retiring it: the fetched
+file and the hand-downloaded one should carry the same rows.
+
 ## Config — `~/.setu/config.json`
 
 | Key | Meaning |
