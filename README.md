@@ -576,6 +576,60 @@ It contains no cancel code path. Roll-out: Phase 0 probe →
 Phase 1 simulate rows prove the route read-only → Phase 2 live
 drill on a known orphan → Phase 3 the second account.
 
+#### Client Portal transport (setu-exec v0.9.0) — the retail path
+
+The OAuth registration above is closed to retail accounts:
+IBKR's self-service portal answers "OAuth1.0a is only
+available to institutional clients. For retail and individual
+clients, authentication to our WebAPI is managed using the
+Client Portal Gateway." v0.9 therefore adds a second transport
+for the same route. The OAuth code stays, dormant, for any
+account that does hold a consumer key.
+
+Setup, per account:
+
+1. **Second username.** In Client Portal (main login):
+   Settings → Users & Access Rights. Create a role with
+   Trading rights only (no withdrawals, transfers or admin),
+   then add a user for the primary account holder with
+   **Secondary user: Yes** and that role. One brokerage session
+   exists per username, so this user's sessions never compete
+   with the IB Gateway session feeding Setu. IBKR approves new
+   usernames in about a business day; the new user enrols its
+   own 2FA on first login.
+   (Note: opening Client Portal under the MAIN username knocks
+   that username's Gateway session out until it is re-logged —
+   do this setup when the Gateway can be re-logged straight
+   after.)
+2. **Client Portal Gateway.** Download `clientportal.gw.zip`
+   from IBKR, unzip it beside the other tools (e.g. `~/cpgw`),
+   and run it: `bin/run.sh root/conf.yaml`. It listens on
+   https://localhost:5000 (self-signed certificate; the
+   executor's Client Portal transport is built for exactly this
+   hop). Log in there in a browser **as the second username**
+   and complete 2FA.
+3. **Config.** `~/.setu/webapi-<account>.json` (mode 600) is
+   just:
+
+   ```json
+   {"mode": "client_portal"}
+   ```
+
+   (`"base_url"` may override the default
+   `https://localhost:5000/v1/api`.) The file holds no secret —
+   the login lives in the gateway — and the executor refuses a
+   group/other-writable file in live mode as before.
+
+Behaviour: the executor tickles the gateway session once per
+poll cycle (an idle Client Portal session dies in minutes) and
+logs `web session up/DOWN` transitions, so a lapsed login is
+visible long before a cancel needs the route. A full session
+lasts about a day; when it lapses, web cancels fail closed at
+gate `web_session` until the gateway is logged in again in the
+browser. Everything else — gates, identity match, brake
+accounting, dual-view verification, streaks — is identical to
+the OAuth transport. `webapi_probe.py` speaks both modes.
+
 ## Config — `~/.setu/config.json`
 
 | Key | Meaning |

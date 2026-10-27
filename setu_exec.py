@@ -459,6 +459,41 @@ v0.8.0 (2026-10-27): a second cancel route, web — the IBKR Web
   session and prints the live-orders list; it has no code path
   that can send a DELETE.
 
+v0.9.0 (2026-10-27): a second transport for the web cancel
+  route — the Client Portal Gateway. IBKR's OAuth self-service
+  portal refuses retail logins ("OAuth1.0a is only available to
+  institutional clients. For retail and individual clients,
+  authentication to our WebAPI is managed using the Client
+  Portal Gateway"), so the v0.8 OAuth transport can never be
+  credentialed on these accounts; it stays in the code,
+  dormant, for any account that does hold a consumer key. The
+  retail path runs IBKR's Java Client Portal Gateway on the
+  executor's machine, logged in through a browser under a
+  SECOND username on the same account (one brokerage session
+  per username, so that session never competes with the IB
+  Gateway session feeding Setu). The gateway serves the same
+  /iserver endpoints at https://localhost:5000/v1/api; the
+  executor's web route is transport-agnostic — identity match,
+  gates, brake accounting and dual-view verification are
+  unchanged, and only session establishment differs: no token
+  minting, the gateway's own authenticated session decides
+  (checked at every use; a lapsed login fails the row closed
+  at gate web_session until the human logs the gateway in
+  again). The credentials file selects the transport:
+  {"mode": "client_portal", "base_url": ...} beside the OAuth
+  shape; it holds no secret in this mode (the login lives in
+  the gateway), but the same live-mode permission hygiene
+  applies to the file. Because a Client Portal session idles
+  out in minutes, a live executor with Client Portal mode
+  configured tickles the session once per poll cycle and logs
+  web-session up/down transitions, so a dead session is
+  visible in the log long before a cancel needs it. The
+  gateway's TLS certificate is self-signed and its listener is
+  localhost-only by configuration; the Client Portal
+  transport therefore does not verify the certificate (the
+  OAuth transport verifies normally). webapi_probe.py speaks
+  both modes.
+
 Config: account, Kubera and Gateway settings come from the same
 ~/.setu/config.json Setu uses (read, never written by this program).
 Mode and executor knobs live in executor.json beside it. The ingest
@@ -480,6 +515,7 @@ import os
 import re
 import secrets
 import shutil
+import ssl
 import stat
 import sys
 import threading
@@ -491,7 +527,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -511,6 +547,10 @@ BENIGN_ERRORS = {2104, 2106, 2107, 2158, 2119}
 # is tied to the target order id.
 CANCEL_CONFIRMED_ERROR_CODE = 202
 WEB_API_BASE = "https://api.ibkr.com/v1/api"
+# v0.9: the Client Portal Gateway transport's default base. The
+# gateway serves the same /iserver endpoints from the machine it
+# runs on, behind its own browser-established session.
+CP_GATEWAY_DEFAULT_BASE = "https://localhost:5000/v1/api"
 WEB_API_TIMEOUT_SECONDS = 20.0
 # Post-DELETE verification (v0.8): poll both order views until
 # the target is absent from both, else take the unverified path
@@ -3751,6 +3791,8 @@ def _java_bigint_bytes(value: int) -> bytes:
 class WebApiCredentials:
     """One account's OAuth 1.0a self-service credential set."""
 
+    mode = "oauth"
+
     def __init__(self, consumer_key: str, access_token: str,
                  access_token_secret: bytes, rsa_modulus: int,
                  rsa_private_exponent: int, dh_prime: int,
@@ -3763,6 +3805,18 @@ class WebApiCredentials:
         self.dh_prime = dh_prime
         self.dh_generator = dh_generator
         self.realm = realm
+
+
+class CpGatewayCredentials:
+    """Client Portal Gateway transport settings (v0.9). Holds no
+    secret: the login lives in the gateway process itself, which
+    a human establishes in a browser under the account's second
+    username. This object only says where the gateway listens."""
+
+    mode = "client_portal"
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url
 
 
 def webapi_credentials_path(cfg: dict, account_id: str) -> Path:
@@ -3798,6 +3852,20 @@ def load_webapi_credentials(cfg: dict, account_id: str,
         raise WebApiError(f"Web API credentials unreadable: {exc}")
     if not isinstance(data, dict):
         raise WebApiError("Web API credentials: not a JSON object")
+
+    mode = str(data.get("mode") or "oauth").strip().lower()
+    if mode == "client_portal":
+        base_url = str(data.get("base_url")
+                       or CP_GATEWAY_DEFAULT_BASE).strip().rstrip("/")
+        if not base_url.startswith(("https://", "http://")):
+            raise WebApiError(
+                "Web API credentials: client_portal base_url must "
+                "be an http(s) URL")
+        return CpGatewayCredentials(base_url)
+    if mode != "oauth":
+        raise WebApiError(
+            f"Web API credentials: unknown mode {mode!r} (expected "
+            f"'oauth' or 'client_portal')")
 
     def _field(name: str) -> str:
         value = data.get(name)
@@ -3847,17 +3915,22 @@ def _webapi_payload_snippet(payload) -> str:
 
 
 def _webapi_default_transport(method: str, url: str, headers: dict,
-                              body: bytes | None):
+                              body: bytes | None, ssl_context=None):
     """urllib over an explicit no-proxy opener (the v0.2.2 lesson:
     proxy environment variables must never fence api.ibkr.com).
     Returns (status, parsed JSON or raw text); transport-level
     failures raise WebApiError, HTTP errors return their status
-    and body for the caller to classify."""
+    and body for the caller to classify. ssl_context is used
+    only by the Client Portal transport (self-signed localhost
+    certificate); the OAuth transport verifies normally."""
     request = urllib.request.Request(url, data=body, method=method)
     for key, value in headers.items():
         request.add_header(key, value)
     request.add_header("User-Agent", f"setu-exec/{VERSION}")
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    handlers = [urllib.request.ProxyHandler({})]
+    if ssl_context is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=ssl_context))
+    opener = urllib.request.build_opener(*handlers)
     try:
         with opener.open(request,
                          timeout=WEB_API_TIMEOUT_SECONDS) as response:
@@ -3868,6 +3941,26 @@ def _webapi_default_transport(method: str, url: str, headers: dict,
         return exc.code, _webapi_parse_json(raw)
     except (urllib.error.URLError, OSError) as exc:
         raise WebApiError(f"Web API transport failed: {exc}")
+
+
+def _cp_gateway_transport(method: str, url: str, headers: dict,
+                          body: bytes | None):
+    """Client Portal Gateway transport: same urllib discipline,
+    but the gateway's certificate is self-signed and its listener
+    is localhost-only, so verification is off for this hop."""
+    context = ssl._create_unverified_context()
+    return _webapi_default_transport(method, url, headers, body,
+                                     ssl_context=context)
+
+
+def _parse_live_orders_payload(payload) -> list[dict]:
+    if isinstance(payload, dict):
+        orders = payload.get("orders")
+        if isinstance(orders, list):
+            return [o for o in orders if isinstance(o, dict)]
+    if isinstance(payload, list):
+        return [o for o in payload if isinstance(o, dict)]
+    raise WebApiError("live orders response carries no orders list")
 
 
 class WebApiClient:
@@ -4012,22 +4105,101 @@ class WebApiClient:
 
     def live_orders(self) -> list[dict]:
         payload = self._request_or_raise("GET", "/iserver/account/orders")
-        if isinstance(payload, dict):
-            orders = payload.get("orders")
-            if isinstance(orders, list):
-                return [o for o in orders if isinstance(o, dict)]
-        if isinstance(payload, list):
-            return [o for o in payload if isinstance(o, dict)]
-        raise WebApiError("live orders response carries no orders list")
+        return _parse_live_orders_payload(payload)
 
     def cancel_order(self, account_id: str, web_order_id: str) -> dict:
         payload = self._request_or_raise(
             "DELETE", f"/iserver/account/{account_id}/order/{web_order_id}")
         return payload if isinstance(payload, dict) else {}
 
+    def tickle(self) -> dict:
+        payload = self._request_or_raise("POST", "/tickle")
+        return payload if isinstance(payload, dict) else {}
 
-def build_webapi_client(creds: WebApiCredentials) -> WebApiClient:
-    """Factory seam: tests substitute a fake client here."""
+
+class CpGatewayClient:
+    """The same /iserver surface, served by the local Client
+    Portal Gateway (v0.9). No signing: the gateway process holds
+    the browser-established session. Every call is plain HTTPS
+    to the gateway's own base URL. The session's authenticated
+    state — not any token — is what init_brokerage_session
+    proves, and a lapsed login raises WebApiError so the cancel
+    fails closed at gate web_session."""
+
+    def __init__(self, base_url: str, transport=None):
+        self.base_url = base_url.rstrip("/")
+        self._transport = transport or _cp_gateway_transport
+
+    def _request_or_raise(self, method: str, path: str, json_body=None):
+        headers = {}
+        body = None
+        if json_body is not None:
+            body = json.dumps(json_body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        status, payload = self._transport(
+            method, self.base_url + path, headers, body)
+        if status < 200 or status >= 300:
+            raise WebApiError(
+                f"{method} {path} failed (HTTP {status}): "
+                f"{_webapi_payload_snippet(payload)}")
+        if isinstance(payload, dict) and payload.get("error"):
+            raise WebApiError(
+                f"{method} {path} returned an error: "
+                f"{_webapi_payload_snippet(payload)}")
+        return payload
+
+    def auth_status(self) -> dict:
+        payload = self._request_or_raise("POST", "/iserver/auth/status")
+        return payload if isinstance(payload, dict) else {}
+
+    def init_brokerage_session(self) -> dict:
+        # ssodh/init establishes the brokerage session on top of
+        # the gateway's SSO login. It can complain when a session
+        # already exists; the auth status is the arbiter either
+        # way, and only an unauthenticated end state fails.
+        init_error = None
+        try:
+            self._request_or_raise(
+                "POST", "/iserver/auth/ssodh/init",
+                json_body={"publish": True, "compete": True})
+        except WebApiError as exc:
+            init_error = exc
+        status = self.auth_status()
+        if status.get("authenticated") is not True:
+            detail = f": {init_error}" if init_error else ""
+            raise WebApiError(
+                "Client Portal Gateway session is not authenticated "
+                f"(log in at {self.base_url.rsplit('/v1/api', 1)[0]} "
+                f"with the account's web username){detail}")
+        return status
+
+    def session_accounts(self) -> list:
+        payload = self._request_or_raise("GET", "/iserver/accounts")
+        if isinstance(payload, dict):
+            accounts = payload.get("accounts")
+            if isinstance(accounts, list):
+                return accounts
+        return []
+
+    def live_orders(self) -> list[dict]:
+        payload = self._request_or_raise("GET", "/iserver/account/orders")
+        return _parse_live_orders_payload(payload)
+
+    def cancel_order(self, account_id: str, web_order_id: str) -> dict:
+        payload = self._request_or_raise(
+            "DELETE", f"/iserver/account/{account_id}/order/{web_order_id}")
+        return payload if isinstance(payload, dict) else {}
+
+    def tickle(self) -> dict:
+        payload = self._request_or_raise("POST", "/tickle")
+        return payload if isinstance(payload, dict) else {}
+
+
+def build_webapi_client(creds):
+    """Factory seam: tests substitute a fake client here. The
+    credential set's mode selects the transport (v0.9)."""
+    if getattr(creds, "mode", "oauth") == "client_portal":
+        return CpGatewayClient(creds.base_url)
     return WebApiClient(creds)
 
 
@@ -4159,6 +4331,9 @@ class Executor:
         # are the module constants).
         self._web_verify_attempts = WEB_VERIFY_ATTEMPTS
         self._web_verify_interval = WEB_VERIFY_INTERVAL_SECONDS
+        # v0.9: Client Portal session health as last tickled
+        # ("unknown" until the first tickle; transitions logged).
+        self._web_session_state = "unknown"
         self._noted: set[str] = set()
         self._last_kill: bool | None = None  # kill state as last read
 
@@ -4213,6 +4388,9 @@ class Executor:
             self._note_once("kill", "kill switch is ON in Kubera; idling")
             return
         self._noted.discard("kill")
+
+        # v0.9: keep a configured Client Portal session warm.
+        self._tickle_web_session()
 
         positions = self.gateway.fetch_positions()
         open_orders = self.gateway.fetch_open_orders()
@@ -4618,6 +4796,57 @@ class Executor:
 
     def _web_credentials_present(self) -> bool:
         return webapi_credentials_path(self.cfg, self.account).exists()
+
+    def _cp_gateway_client(self):
+        """A Client Portal client when this account's webapi
+        config selects that transport, else None. Loading never
+        touches the network; a broken config returns None here
+        (the cancel path itself reports web_credentials with the
+        precise reason when a row actually needs the route)."""
+        try:
+            creds = load_webapi_credentials(
+                self.cfg, self.account, enforce_permissions=False)
+        except WebApiError:
+            return None
+        if creds is None or getattr(creds, "mode", "") != "client_portal":
+            return None
+        return build_webapi_client(creds)
+
+    def _tickle_web_session(self) -> None:
+        """Keep a Client Portal Gateway session alive (v0.9): the
+        gateway idles an untouched session out in minutes, so a
+        configured CP transport is tickled once per cycle and its
+        authenticated state tracked. Transitions are logged once
+        each way, so a lapsed login is visible in the log long
+        before a cancel needs the route. OAuth mode needs no
+        tickle (its token is minted per attempt). Never raises:
+        a tickle failure is a state change, not a cycle failure."""
+        client = self._cp_gateway_client()
+        if client is None:
+            return
+        try:
+            payload = client.tickle()
+            iserver = payload.get("iserver")
+            auth = (iserver.get("authStatus")
+                    if isinstance(iserver, dict) else None)
+            authenticated = (isinstance(auth, dict)
+                             and auth.get("authenticated") is True)
+            state = "up" if authenticated else "down"
+            detail = ("tickled; session authenticated"
+                      if authenticated else
+                      "tickled; session NOT authenticated (the "
+                      "gateway login has lapsed — web cancels will "
+                      "fail at gate web_session until it is renewed)")
+        except Exception as exc:
+            state = "down"
+            detail = (f"tickle failed ({type(exc).__name__}: {exc}); "
+                      f"the gateway looks unreachable")
+        if state != self._web_session_state:
+            if state == "up":
+                log(f"web session up: Client Portal Gateway {detail}")
+            else:
+                log(f"web session DOWN: Client Portal Gateway {detail}")
+            self._web_session_state = state
 
     def _web_identity_match(self, row: dict, client):
         """Mint the web session and identity-match the target in

@@ -137,3 +137,10 @@ Notes:
 - Kubera needs no change to support the route: rows without
   `web_order_id` work (the perm id is the fallback key), and a
   scanner stamp, when present, is display-only.
+- Transport (v0.9): the executor reaches the Web API either by
+  OAuth against api.ibkr.com (institutional credentials) or via
+  a local Client Portal Gateway under a second username on the
+  account (the retail path; IBKR gates OAuth self-service to
+  institutional clients). The transport is invisible to this
+  contract: same endpoints, same gates, same events. A lapsed
+  gateway login surfaces as a `web_session` refusal.
