@@ -14,7 +14,7 @@ import json
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -445,6 +445,67 @@ class ConvertModeTests(unittest.TestCase):
                                   backup_root=Path(tmp) / "backups")
             self.assertEqual(target.read_text(encoding="utf-8"),
                              "OLD")
+
+
+class _RaisingClient:
+    def __init__(self, exc):
+        self._exc = exc
+        self.calls = 0
+
+    def fetch(self, *a, **k):
+        self.calls += 1
+        raise self._exc
+
+
+class PauseGuardTests(unittest.TestCase):
+    """IBKR's 1025 block lasts ~an hour and covers the query
+    with any token (and vice versa); attempts inside the
+    window feed it. flex_pull records the block and refuses
+    to call IBKR until it lapses."""
+
+    def make_job(self, tmp):
+        token_file = Path(tmp) / "token.txt"
+        token_file.write_text("TOK999", encoding="utf-8")
+        return {"name": "zonito", "account_id": "U19377323",
+                "query_id": "1687614", "token_file": str(token_file),
+                "output_dir": str(Path(tmp) / "drive")}
+
+    def test_1025_records_pause_and_next_run_stays_quiet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = self.make_job(tmp)
+            backups = Path(tmp) / "backups"
+            raiser = _RaisingClient(flex_pull.FlexError(
+                "SendRequest failed: 1025", code="1025"))
+            with self.assertRaises(flex_pull.FlexError):
+                flex_pull.run_job(job, date(2026, 10, 28),
+                                  client_factory=lambda t: raiser,
+                                  backup_root=backups)
+            self.assertEqual(raiser.calls, 1)
+            good = StubClient()
+            with self.assertRaises(flex_pull.FlexError) as ctx:
+                flex_pull.run_job(
+                    job, date(2026, 10, 28),
+                    client_factory=lambda t: good,
+                    backup_root=backups)
+            self.assertIn("pause in force", str(ctx.exception))
+            self.assertEqual(good.calls, [])
+
+    def test_expired_pause_lets_the_run_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = self.make_job(tmp)
+            backups = Path(tmp) / "backups"
+            backups.mkdir(parents=True)
+            past = (datetime.now().astimezone()
+                    - timedelta(hours=2)).isoformat()
+            (Path(tmp) / "flex-pause.json").write_text(
+                json.dumps({"zonito": {"until": past,
+                                       "code": "1025"}}),
+                encoding="utf-8")
+            result = flex_pull.run_job(
+                job, date(2026, 10, 27),
+                client_factory=lambda t: StubClient(),
+                backup_root=backups)
+            self.assertTrue(result["ok"])
 
 
 class ConfigTests(unittest.TestCase):

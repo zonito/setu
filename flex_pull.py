@@ -55,7 +55,7 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-FLEX_PULL_VERSION = "0.2.5"
+FLEX_PULL_VERSION = "0.2.6"
 FLEX_BASE = ("https://ndcdyn.interactivebrokers.com"
              "/Universal/servlet/FlexStatementService")
 # IBKR error 1019: statement generation in progress — retryable.
@@ -284,9 +284,52 @@ def load_config(path: Path) -> list:
     return jobs
 
 
+IBKR_PAUSE_S = 3600  # documented 1025 pause: one hour
+
+
+def _pause_path(backup_root) -> Path:
+    base = backup_root.parent if backup_root is not None \
+        else Path.home() / ".setu"
+    return base / "flex-pause.json"
+
+
+def _pause_until(name: str, backup_root, now: datetime):
+    """The recorded 1025 pause deadline for a job, if still in
+    force. IBKR's 1025 block lasts about an hour and covers
+    the query with any token and the token with any query —
+    a fresh token does not help, and every attempt inside
+    the window feeds it (learned 2026-10-28)."""
+    try:
+        data = json.loads(
+            _pause_path(backup_root).read_text(encoding="utf-8"))
+        until = datetime.fromisoformat(data[name]["until"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return until if until > now else None
+
+
+def _record_pause(name: str, backup_root, now: datetime) -> None:
+    path = _pause_path(backup_root)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data[name] = {"until": (now + timedelta(
+        seconds=IBKR_PAUSE_S)).isoformat(), "code": "1025"}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 def run_job(job: dict, asof: date, client_factory=None,
             backup_root: Path | None = None) -> dict:
     name = job["name"]
+    paused = _pause_until(name, backup_root,
+                          datetime.now().astimezone())
+    if paused is not None:
+        raise FlexError(
+            "IBKR 1025 pause in force until "
+            f"{paused:%H:%M} — not calling (attempts inside "
+            "the window feed the block)", code="1025")
     token_path = Path(job["token_file"]).expanduser()
     try:
         token = token_path.read_text(encoding="utf-8").strip()
@@ -298,7 +341,13 @@ def run_job(job: dict, asof: date, client_factory=None,
         lambda tok: FlexClient(tok, log=log_line))
     client = factory(token)
     start, end, stem = month_window(asof)
-    csv_text = client.fetch(job["query_id"], start, end)
+    try:
+        csv_text = client.fetch(job["query_id"], start, end)
+    except FlexError as exc:
+        if exc.code == "1025":
+            _record_pause(name, backup_root,
+                          datetime.now().astimezone())
+        raise
     raw_text = csv_text
     converted = False
     if job.get("convert"):
