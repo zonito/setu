@@ -345,6 +345,27 @@ GEN_FAIL_1001 = (
     "</ErrorMessage></FlexStatementResponse>")
 
 
+ACTIVITY_CSV = (
+    "HEADER,CRTT,ClientAccountID,AccountAlias\n"
+    "DATA,CRTT,acct,zonito\n"
+    "HEADER,TRNT,ClientAccountID\n")
+
+
+class RawFlexCsvDownloadTests(unittest.TestCase):
+    """A convert-mode download is the Activity envelope, not
+    the statement envelope: the first GetStatement poll can
+    already carry it, and fetch must hand it back, not feed
+    it to the XML parser (0.2.3 failed a good 06:45 run)."""
+
+    def test_first_poll_activity_csv_is_returned(self):
+        opener = _FakeOpener([SEND_OK, ACTIVITY_CSV])
+        client = flex_pull.FlexClient("TOK999", opener=opener,
+                                      sleeper=lambda s: None)
+        body = client.fetch("1687614", date(2026, 10, 1),
+                            date(2026, 10, 26))
+        self.assertEqual(body, ACTIVITY_CSV)
+
+
 class SendRetryTests(unittest.TestCase):
     def test_send_1001_is_retried(self):
         opener = _FakeOpener([GEN_FAIL_1001, SEND_OK, SAMPLE_CSV])

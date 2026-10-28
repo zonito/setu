@@ -55,7 +55,7 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-FLEX_PULL_VERSION = "0.2.3"
+FLEX_PULL_VERSION = "0.2.4"
 FLEX_BASE = ("https://ndcdyn.interactivebrokers.com"
              "/Universal/servlet/FlexStatementService")
 # IBKR error 1019: statement generation in progress — retryable.
@@ -126,6 +126,18 @@ def looks_like_statement(text: str) -> bool:
     stripped = text.lstrip("\ufeff \t\r\n")
     return (stripped.startswith("Statement,")
             or "Transaction History,Header" in text)
+
+
+def looks_like_flex_csv(text: str) -> bool:
+    """A raw Activity Flex CSV body: the HEADER/DATA + section
+    code envelope (HEADER,CRTT,...). Convert-mode jobs download
+    this shape, not the statement envelope — 0.2.3 mistook a
+    successful first-poll download for an XML error envelope
+    and failed the run on its parse error (live 2026-10-28
+    06:45; the error text is byte-identical to feeding the CSV
+    to the XML parser)."""
+    stripped = text.lstrip("\ufeff \t\r\n")
+    return stripped.startswith("HEADER,")
 
 
 def validate_statement(csv_text: str) -> dict:
@@ -228,7 +240,7 @@ class FlexClient:
         waited = 0
         while True:
             body = self._get(url)
-            if looks_like_statement(body):
+            if looks_like_statement(body) or looks_like_flex_csv(body):
                 return body
             info = parse_flex_xml(body)
             if info["error_code"] in RETRYABLE_ERROR_CODES:
