@@ -43,7 +43,7 @@ import io
 import re
 from datetime import datetime
 
-CONVERT_VERSION = "0.2.0"
+CONVERT_VERSION = "0.2.1"
 
 TH_HEADER = ["Transaction History", "Header", "Date", "Account",
              "Description", "Transaction Type", "Symbol", "Quantity",
@@ -225,7 +225,11 @@ def _vat_row(fee_row: dict, account: str,
     if not parts:
         return None
     kind, head, _suffix = parts
-    head = head[:1].lower() + head[1:]
+    # The statement lowercases the whole masked account token
+    # (up to the colon): Z******87 -> z******87 and, proven on
+    # Nikhila's October file, N******KR -> n******kr.
+    colon = head.index(":")
+    head = head[:colon + 1].lower() + head[colon + 1:]
     text = f"VAT Cancel[{head}]" if kind == "cancel" else f"VAT {head}"
     vat = round(0.2 * base_amount, 2)
     date = _date(fee_row["Date/Time"].split(";")[0])

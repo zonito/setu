@@ -177,6 +177,19 @@ class CashTests(unittest.TestCase):
             descs[("Sales Tax",
                    "VAT Cancel[z******87:OPRA NP L1]")], "0.3")
 
+    def test_opra_vat_lowercases_alpha_mask(self):
+        # Nikhila's mask ends in letters; the statement's VAT
+        # rendering lowercases the whole mask token.
+        ctrn = [
+            "acct,acct,,USD,1,,N******KR:OPRA NP L1 FOR OCT 2026,"
+            "20261002,-1.5,Other Fees",
+        ]
+        rows = th_rows(convert(crtt_rows=BASE_CRTT,
+                               ctrn_rows=ctrn)[0])
+        descs = {(r[5], r[4]): r[10] for r in rows}
+        self.assertEqual(
+            descs[("Sales Tax", "VAT n******kr:OPRA NP L1")], "-0.3")
+
     def test_exposure_fee_drops_period_suffix(self):
         ctrn = ['acct,acct,,USD,1,,"EXPOSURE FEE, EQUITY FOR '
                 '20261024 FOR OCT 2026",20261026,-22.35,Other Fees']
