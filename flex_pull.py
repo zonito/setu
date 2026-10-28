@@ -55,7 +55,7 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-FLEX_PULL_VERSION = "0.2.4"
+FLEX_PULL_VERSION = "0.2.5"
 FLEX_BASE = ("https://ndcdyn.interactivebrokers.com"
              "/Universal/servlet/FlexStatementService")
 # IBKR error 1019: statement generation in progress — retryable.
@@ -178,10 +178,16 @@ class FlexClient:
     """One login's Flex Web Service. Transport and sleeper are
     injectable for tests."""
 
-    def __init__(self, token: str, opener=None, sleeper=None):
+    def __init__(self, token: str, opener=None, sleeper=None,
+                 log=None):
         self._token = token
         self._opener = opener or _no_proxy_opener()
         self._sleep = sleeper if sleeper is not None else time.sleep
+        # Progress lines during long waits (0.2.5): a run that
+        # sits in a 5-minute send retry or a generation poll
+        # used to look hung; the waits are legitimate IBKR
+        # behaviour and now say so in the log.
+        self._log = log or (lambda message: None)
 
     def _get(self, url: str) -> str:
         req = urllib.request.Request(url, headers={
@@ -228,6 +234,8 @@ class FlexClient:
                 if (exc.code != "1001" or not delays
                         or waited_send + delays[0] > max_wait_s):
                     raise
+                self._log("SendRequest 1001 (IBKR busy); "
+                          f"retrying in {delays[0]}s")
                 self._sleep(delays[0])
                 waited_send += delays.pop(0)
         # GetStatement takes the reference in q, like
@@ -248,6 +256,8 @@ class FlexClient:
                     raise FlexError(
                         "statement still generating after "
                         f"{max_wait_s}s (ref {reference})")
+                self._log("statement still generating; "
+                          f"waited {waited}s")
                 self._sleep(interval_s)
                 waited += interval_s
                 continue
@@ -284,7 +294,8 @@ def run_job(job: dict, asof: date, client_factory=None,
         raise FlexError(f"token file unreadable: {token_path}") from exc
     if not token:
         raise FlexError(f"token file is empty: {token_path}")
-    factory = client_factory or (lambda tok: FlexClient(tok))
+    factory = client_factory or (
+        lambda tok: FlexClient(tok, log=log_line))
     client = factory(token)
     start, end, stem = month_window(asof)
     csv_text = client.fetch(job["query_id"], start, end)

@@ -325,11 +325,14 @@ class RealClientTests(unittest.TestCase):
 
     def test_fetch_uses_q_for_reference_and_polls(self):
         opener = _FakeOpener([SEND_OK, GENERATING, SAMPLE_CSV])
+        lines = []
         client = flex_pull.FlexClient("TOK999", opener=opener,
-                                      sleeper=lambda s: None)
+                                      sleeper=lambda s: None,
+                                      log=lines.append)
         body = client.fetch("1687614", date(2026, 10, 1),
                             date(2026, 10, 26))
         self.assertEqual(body, SAMPLE_CSV)
+        self.assertTrue(any("generating" in ln for ln in lines))
         self.assertIn("q=1687614", opener.urls[0])
         self.assertIn("fd=20261001", opener.urls[0])
         for url in opener.urls[1:]:
