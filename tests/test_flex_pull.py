@@ -503,7 +503,7 @@ class PauseGuardTests(unittest.TestCase):
                 encoding="utf-8")
             result = flex_pull.run_job(
                 job, date(2026, 10, 27),
-                client_factory=lambda t: StubClient(),
+                client_factory=lambda t: StubClient(body=SAMPLE_CSV),
                 backup_root=backups)
             self.assertTrue(result["ok"])
 
