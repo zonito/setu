@@ -315,13 +315,19 @@ class ModeAndArmTests(unittest.TestCase):
             mode, refusal = setu_exec.resolve_mode(cfg)
             self.assertEqual((mode, refusal), ("simulate", None))
 
-    def test_arm_must_be_today(self):
+    def test_arm_persists_until_changed(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_cfg(tmp)
             self.assertFalse(setu_exec.is_armed(cfg))
+            # An old build's arm file carries a date string; under
+            # set-till-changed semantics (v0.9.2) it still counts.
             setu_exec.arm_path(cfg).write_text("1999-01-01\n", encoding="utf-8")
-            self.assertFalse(setu_exec.is_armed(cfg),
-                             "yesterday's arm never works")
+            self.assertTrue(setu_exec.is_armed(cfg),
+                            "an arm set on any earlier day stays armed")
+            # An empty file fails closed: disarm removes the file, so
+            # an empty one is an accident, not a state.
+            setu_exec.arm_path(cfg).write_text("", encoding="utf-8")
+            self.assertFalse(setu_exec.is_armed(cfg))
             arm(cfg)
             self.assertTrue(setu_exec.is_armed(cfg))
 

@@ -19,9 +19,11 @@ Modes (executor.json next to the main config, default "simulate"):
              it the executor refuses to start.
 
 Safety rails, both modes, no exceptions:
-  * Daily arm file (executor.armed, contents = today's Europe/London
-    date). Yesterday's arm never works. `arm` writes it, `disarm`
-    removes it.
+  * Persistent arm file (executor.armed). `arm` writes it and the
+    executor stays armed until `disarm` removes it — no daily
+    expiry (Zonito's instruction, 2026-10-29: the daily re-arm was
+    dropped as pure friction; the kill switch, per-order approvals
+    and the runaway brake remain the live controls).
   * Kubera kill switch, read fresh every cycle, fail-closed: any
     control-read failure or malformed reply idles the cycle.
   * Gates, in order: live reads (complete, or the cycle aborts) ->
@@ -527,7 +529,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -2261,8 +2263,14 @@ def state_path(cfg: dict) -> Path:
 
 
 def is_armed(cfg: dict) -> bool:
+    """Armed = the arm file exists with any content. The arm is set
+    until changed (persistent since v0.9.2): a file written by an
+    older build carries a date string, which counts as armed just
+    the same. An empty file is NOT armed — `disarm` removes the
+    file, so an empty one only appears by accident, and accidents
+    fail closed."""
     try:
-        return arm_path(cfg).read_text(encoding="utf-8").strip() == london_today()
+        return bool(arm_path(cfg).read_text(encoding="utf-8").strip())
     except OSError:
         return False
 
@@ -4383,7 +4391,7 @@ class Executor:
             log(f"refusing to run: {self.mode_refusal}")
             return
         if not is_armed(self.cfg):
-            self._note_once("arm", "not armed for today; idling "
+            self._note_once("arm", "not armed; idling "
                                    "(setu_exec.py arm to arm)")
             return
         self._noted.discard("arm")
@@ -6384,9 +6392,8 @@ def main() -> int:
     cfg = load_config(args.config)
 
     if args.command == "arm":
-        arm_path(cfg).write_text(london_today() + "\n", encoding="utf-8")
-        print(f"armed for {london_today()} (Europe/London). "
-              "Arming never carries overnight.")
+        arm_path(cfg).write_text("armed\n", encoding="utf-8")
+        print("armed. The arm now stays set until you run disarm.")
         return 0
     if args.command == "disarm":
         arm_path(cfg).unlink(missing_ok=True)
@@ -6400,8 +6407,8 @@ def main() -> int:
         except OSError:
             pass  # the live hygiene check will refuse loudly if loose
         print(f"live enable file written: {live_path(cfg)}. "
-              "Live mode also needs mode=live in executor.json, a daily "
-              "arm, and the Kubera kill switch off.")
+              "Live mode also needs mode=live in executor.json, the "
+              "executor armed, and the Kubera kill switch off.")
         return 0
     if args.command == "disable-live":
         live_path(cfg).unlink(missing_ok=True)

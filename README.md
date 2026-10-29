@@ -102,10 +102,11 @@ revalidate them live, and report the outcome back to Kubera.
   `~/.setu/executor.live` to exist; mode `live` without it refuses
   to start. (`setu_exec.py enable-live` / `disable-live` manage it.)
 
-**Daily ritual:** the executor also needs a fresh arm every day —
-`~/.setu/venv/bin/python ~/.setu/setu_exec.py arm` writes today's
-date (Europe/London) into `~/.setu/executor.armed`; yesterday's arm
-never works, and `disarm` removes it. Kubera's per-account kill
+**Arming:** the executor must be armed —
+`~/.setu/venv/bin/python ~/.setu/setu_exec.py arm` writes
+`~/.setu/executor.armed`; the arm stays set until `disarm` removes
+it (persistent since v0.9.2; the earlier daily-expiring arm was
+dropped at Zonito's instruction). Kubera's per-account kill
 switch is read fresh every cycle and idles the executor while on.
 
 **Gates, in order, every placement:** armed → kill switch off →
