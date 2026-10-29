@@ -496,6 +496,18 @@ v0.9.0 (2026-10-27): a second transport for the web cancel
   OAuth transport verifies normally). webapi_probe.py speaks
   both modes.
 
+v0.9.3 (2026-10-29): IB error 10275 (positions unavailable for
+  an account whose application is unfinished) is emitted on the
+  session when ANY account in the login family has a pending
+  application — proven live when U29797144's pending application
+  poisoned every positions read of the U19377323 executor and
+  idled it for hours while the read daemon pushed normally.
+  Classification: a 10275 naming only OTHER accounts is a notice
+  (logged once per account, never read poison — this executor's
+  read is scoped to its own account and complete without them);
+  a 10275 naming THIS account, or carrying no parseable account,
+  fails the read exactly as before. Fail closed on ambiguity.
+
 Config: account, Kubera and Gateway settings come from the same
 ~/.setu/config.json Setu uses (read, never written by this program).
 Mode and executor knobs live in executor.json beside it. The ingest
@@ -529,7 +541,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 LONDON = ZoneInfo("Europe/London")
 CLIENT_ID = 91
 WHATIF_MARGIN_TOLERANCE = 50.0  # account currency; closing must not add margin
@@ -548,6 +560,28 @@ BENIGN_ERRORS = {2104, 2106, 2107, 2158, 2119}
 # information the cancel paths must classify — and only when it
 # is tied to the target order id.
 CANCEL_CONFIRMED_ERROR_CODE = 202
+# IB error 10275: "Positions info is not available for account(s):
+# U... until the application is finished and approved." Emitted on
+# the session when any account in the login family has an
+# unfinished application. See foreign_pending_application().
+PENDING_APPLICATION_ERROR_CODE = 10275
+_ACCOUNT_ID_RE = re.compile(r"\bU\d{8}\b")
+
+
+def foreign_pending_application(error_code, error_string,
+                                own_account) -> list[str] | None:
+    """The account ids a 10275 names, when it names ONLY accounts
+    other than this executor's own — the case where the notice
+    says nothing about our positions and must not poison a read.
+    None in every other case (wrong code, no parseable account,
+    or our own account named): the caller then treats the error
+    as it always has, fail closed."""
+    if error_code != PENDING_APPLICATION_ERROR_CODE:
+        return None
+    named = _ACCOUNT_ID_RE.findall(error_string or "")
+    if not named or own_account in named:
+        return None
+    return named
 WEB_API_BASE = "https://api.ibkr.com/v1/api"
 # v0.9: the Client Portal Gateway transport's default base. The
 # gateway serves the same /iserver endpoints from the machine it
@@ -2703,6 +2737,9 @@ class ExecGateway:
 
         self.cfg = cfg
         self.account = str(cfg["account_id"])
+        # Foreign accounts already logged as pending-application
+        # notices (10275, v0.9.3): log once per account per process.
+        self._pending_application_noted: set[str] = set()
         self.connected_event = threading.Event()
         self.read_error: str | None = None  # set by an IB error mid-read
         self._reading = False
@@ -2896,6 +2933,21 @@ class ExecGateway:
                     if qslot["error"] is None:
                         qslot["error"] = (f"IB error {errorCode}: "
                                           f"{errorString}")
+                    return
+                foreign = foreign_pending_application(
+                    errorCode, errorString, outer.account)
+                if foreign is not None:
+                    # A pending application on ANOTHER account in
+                    # the login family (v0.9.3): a notice about
+                    # their positions, not ours — log once per
+                    # account and never poison the read.
+                    for acct in foreign:
+                        if acct not in outer._pending_application_noted:
+                            outer._pending_application_noted.add(acct)
+                            log(f"gateway notice {errorCode}: positions "
+                                f"unavailable for pending-application "
+                                f"account {acct}; ignoring (this "
+                                f"executor's account is {outer.account})")
                     return
                 slot = outer.pending.get(int(reqId)) if isinstance(reqId, int) else None
                 if slot is not None:

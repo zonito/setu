@@ -703,6 +703,73 @@ class ReadCompletionTests(unittest.TestCase):
             self.assertIsNotNone(gw.read_error)
 
 
+class PendingApplicationNoticeTests(unittest.TestCase):
+    """v0.9.3: IB error 10275 announces an account in the login
+    family whose application is unfinished. Naming only foreign
+    accounts it is a notice, not read poison; naming this
+    executor's own account (or no parseable account) still fails
+    the read, fail closed."""
+
+    FOREIGN = ("Positions info is not available for account(s): "
+               "U29797144 until the application is finished and "
+               "approved.")
+    OWN = ("Positions info is not available for account(s): "
+           "U19377323 until the application is finished and "
+           "approved.")
+    NO_ACCOUNT = ("Positions info is not available until the "
+                  "application is finished and approved.")
+
+    class _Client(FakeIBClient):
+        def __init__(self, gw, notice=None, **kw):
+            super().__init__(gw, **kw)
+            self.notice = notice
+
+        def reqPositions(self):
+            contract = SimpleNamespace(conId=843250654,
+                                       multiplier="100",
+                                       secType="OPT", symbol="ASTS")
+            self.gw.wrapper.position("U19377323", contract, -5.0, 628.0)
+            if self.notice:
+                self.gw.wrapper.error(-1, 10275, self.notice)
+            self.gw.wrapper.positionEnd()
+
+    def _gateway(self, tmp, notice):
+        gw = setu_exec.ExecGateway(make_cfg(tmp))
+        gw.client = self._Client(gw, notice=notice)
+        return gw
+
+    def test_foreign_notice_does_not_poison_the_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = self._gateway(tmp, self.FOREIGN)
+            positions = gw.fetch_positions(timeout=2.0)
+            self.assertIn(843250654, positions)
+            self.assertIsNone(gw.read_error)
+
+    def test_own_account_notice_still_fails_the_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = self._gateway(tmp, self.OWN)
+            self.assertIsNone(gw.fetch_positions(timeout=2.0))
+            self.assertIsNotNone(gw.read_error)
+
+    def test_unparseable_notice_still_fails_the_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = self._gateway(tmp, self.NO_ACCOUNT)
+            self.assertIsNone(gw.fetch_positions(timeout=2.0))
+            self.assertIsNotNone(gw.read_error)
+
+    def test_classifier_edges(self):
+        f = setu_exec.foreign_pending_application
+        self.assertEqual(f(10275, self.FOREIGN, "U19377323"),
+                         ["U29797144"])
+        self.assertIsNone(f(10275, self.OWN, "U19377323"))
+        self.assertIsNone(f(10275, self.NO_ACCOUNT, "U19377323"))
+        self.assertIsNone(f(1100, self.FOREIGN, "U19377323"))
+        mixed = ("account(s): U29797144, U19377323 until the "
+                 "application is finished")
+        self.assertIsNone(f(10275, mixed, "U19377323"),
+                          "own account among the named: fail closed")
+
+
 class IncompleteGateway(FakeGateway):
     def fetch_positions(self):
         return None
