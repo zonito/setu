@@ -403,6 +403,69 @@ class SendRetryTests(unittest.TestCase):
                          date(2026, 10, 26))
 
 
+class UnparseableResponseTests(unittest.TestCase):
+    """0.2.7: when IBKR's Flex service degrades it can answer
+    with non-XML bodies. One junk poll response must not kill
+    the run (live 2026-10-29 06:45: a clean 1019, then a
+    non-XML poll body 20s later, run dead), the body is saved
+    for diagnosis, and junk on SendRequest rides the same
+    minutes-scale ladder as 1001."""
+
+    JUNK = "Service temporarily unavailable, please retry"
+
+    def _client(self, routes, saved, sleeps):
+        opener = FakeOpener(routes)
+        return flex_pull.FlexClient(
+            "TOKEN123", opener=opener, sleeper=sleeps.append,
+            on_unparseable=lambda stage, body: saved.append((stage, body)))
+
+    def test_junk_poll_then_statement_succeeds(self):
+        saved, sleeps = [], []
+        client = self._client([
+            ("SendRequest", [SUCCESS_XML]),
+            ("GetStatement", [GENERATING_XML, self.JUNK, SAMPLE_CSV]),
+        ], saved, sleeps)
+        body = client.fetch("1687614", date(2026, 10, 1),
+                            date(2026, 10, 26))
+        self.assertEqual(body, SAMPLE_CSV)
+        self.assertEqual(saved, [("GetStatement", self.JUNK)])
+        self.assertEqual(sleeps, [20, 20])
+
+    def test_junk_polls_until_budget_fail_with_excerpt(self):
+        saved, sleeps = [], []
+        client = self._client([
+            ("SendRequest", [SUCCESS_XML]),
+            ("GetStatement", [self.JUNK]),
+        ], saved, sleeps)
+        with self.assertRaises(flex_pull.FlexError) as ctx:
+            client.fetch("1687614", date(2026, 10, 1),
+                         date(2026, 10, 26),
+                         max_wait_s=40, interval_s=20)
+        self.assertIn("unparseable", str(ctx.exception))
+        self.assertEqual(len(saved), 3)
+
+    def test_junk_send_retries_on_the_1001_ladder(self):
+        saved, sleeps = [], []
+        client = self._client([
+            ("SendRequest", [self.JUNK, SUCCESS_XML]),
+            ("GetStatement", [SAMPLE_CSV]),
+        ], saved, sleeps)
+        body = client.fetch("1687614", date(2026, 10, 1),
+                            date(2026, 10, 26))
+        self.assertEqual(body, SAMPLE_CSV)
+        self.assertEqual(sleeps, [300])
+        self.assertEqual(saved, [("SendRequest", self.JUNK)])
+
+    def test_junk_send_gives_up_after_the_ladder(self):
+        saved, sleeps = [], []
+        client = self._client([("SendRequest", [self.JUNK])],
+                              saved, sleeps)
+        with self.assertRaises(flex_pull.FlexError):
+            client.fetch("1687614", date(2026, 10, 1),
+                         date(2026, 10, 26))
+        self.assertEqual(sleeps, [300, 600, 900])
+
+
 class ConvertModeTests(unittest.TestCase):
     def make_job(self, tmp, convert=True):
         token_file = Path(tmp) / "token.txt"

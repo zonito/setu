@@ -55,7 +55,7 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-FLEX_PULL_VERSION = "0.2.6"
+FLEX_PULL_VERSION = "0.2.7"
 FLEX_BASE = ("https://ndcdyn.interactivebrokers.com"
              "/Universal/servlet/FlexStatementService")
 # IBKR error 1019: statement generation in progress — retryable.
@@ -179,7 +179,7 @@ class FlexClient:
     injectable for tests."""
 
     def __init__(self, token: str, opener=None, sleeper=None,
-                 log=None):
+                 log=None, on_unparseable=None):
         self._token = token
         self._opener = opener or _no_proxy_opener()
         self._sleep = sleeper if sleeper is not None else time.sleep
@@ -188,6 +188,22 @@ class FlexClient:
         # used to look hung; the waits are legitimate IBKR
         # behaviour and now say so in the log.
         self._log = log or (lambda message: None)
+        # Diagnostic sink for response bodies that are neither
+        # the statement nor a parseable error envelope (0.2.7):
+        # run_job saves them under the backups dir so the next
+        # degraded-IBKR morning is diagnosable from the artefact,
+        # not from an XML parser's guess. Never fatal.
+        self._on_unparseable = on_unparseable
+
+    def _note_unparseable(self, stage: str, body: str) -> str:
+        """Hand an unclassifiable response body to the diagnostic
+        sink and return a one-line excerpt for logs/errors."""
+        if self._on_unparseable is not None:
+            try:
+                self._on_unparseable(stage, body)
+            except Exception:
+                pass  # diagnostics must never kill the fetch
+        return " ".join((body or "").split())[:120]
 
     def _get(self, url: str) -> str:
         req = urllib.request.Request(url, headers={
@@ -205,7 +221,18 @@ class FlexClient:
             "td": to_date.strftime("%Y%m%d"),
         })
         body = self._get(f"{FLEX_BASE}.SendRequest?{query}")
-        info = parse_flex_xml(body)
+        try:
+            info = parse_flex_xml(body)
+        except FlexError as exc:
+            # Not XML at all: when IBKR's Flex service degrades
+            # it answers some calls with non-XML bodies (seen
+            # live in the GetStatement poll 2026-10-29 06:45).
+            # Save the body and let fetch()'s send ladder treat
+            # it like 1001 — same sickness, same cadence.
+            excerpt = self._note_unparseable("SendRequest", body)
+            raise FlexError(
+                "SendRequest returned an unparseable response: "
+                f"{excerpt}", code="unparseable") from exc
         if info["status"] == "Success" and info["reference"]:
             return info["reference"]
         raise FlexError(
@@ -231,11 +258,14 @@ class FlexClient:
                                               to_date)
                 break
             except FlexError as exc:
-                if (exc.code != "1001" or not delays
+                if (exc.code not in ("1001", "unparseable")
+                        or not delays
                         or waited_send + delays[0] > max_wait_s):
                     raise
-                self._log("SendRequest 1001 (IBKR busy); "
-                          f"retrying in {delays[0]}s")
+                what = ("SendRequest 1001 (IBKR busy)"
+                        if exc.code == "1001"
+                        else "SendRequest unparseable (IBKR degraded)")
+                self._log(f"{what}; retrying in {delays[0]}s")
                 self._sleep(delays[0])
                 waited_send += delays.pop(0)
         # GetStatement takes the reference in q, like
@@ -246,11 +276,35 @@ class FlexClient:
             "t": self._token, "q": reference, "v": "3"})
         url = f"{FLEX_BASE}.GetStatement?{query}"
         waited = 0
+        unparseable_polls = 0
         while True:
             body = self._get(url)
             if looks_like_statement(body) or looks_like_flex_csv(body):
                 return body
-            info = parse_flex_xml(body)
+            try:
+                info = parse_flex_xml(body)
+            except FlexError:
+                # A non-XML poll body while IBKR is degraded
+                # (live 2026-10-29 06:45: one junk poll killed
+                # the run 20s after a clean 1019). It carries no
+                # verdict about the statement, so it is treated
+                # as still-generating: save the body, log it,
+                # keep polling inside the same wait budget.
+                excerpt = self._note_unparseable("GetStatement", body)
+                unparseable_polls += 1
+                if waited >= max_wait_s:
+                    raise FlexError(
+                        "statement not retrievable after "
+                        f"{max_wait_s}s (ref {reference}); poll "
+                        "responses turned unparseable "
+                        f"(x{unparseable_polls}, latest saved): "
+                        f"{excerpt}")
+                self._log("unparseable poll response (saved); "
+                          "treating as still generating; "
+                          f"waited {waited}s")
+                self._sleep(interval_s)
+                waited += interval_s
+                continue
             if info["error_code"] in RETRYABLE_ERROR_CODES:
                 if waited >= max_wait_s:
                     raise FlexError(
@@ -337,8 +391,20 @@ def run_job(job: dict, asof: date, client_factory=None,
         raise FlexError(f"token file unreadable: {token_path}") from exc
     if not token:
         raise FlexError(f"token file is empty: {token_path}")
+    def _save_unparseable(stage: str, body: str) -> None:
+        if backup_root is None:
+            return
+        try:
+            backup_root.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            (backup_root / f"{name}-unparseable-{stage}-{stamp}.txt"
+             ).write_text(body, encoding="utf-8")
+        except OSError:
+            pass
+
     factory = client_factory or (
-        lambda tok: FlexClient(tok, log=log_line))
+        lambda tok: FlexClient(tok, log=log_line,
+                               on_unparseable=_save_unparseable))
     client = factory(token)
     start, end, stem = month_window(asof)
     try:
