@@ -75,6 +75,33 @@ class EnvelopeTests(unittest.TestCase):
             convert(crtt_rows=[])
 
 
+class QuotedInputTests(unittest.TestCase):
+    """Live Flex bodies are fully quoted ("HEADER","CRTT",...);
+    the fixtures are not. Conversion reads through csv.reader,
+    so both shapes must produce the identical statement — this
+    pins that, because the 0.2.8 poll-classifier fix is only
+    safe if quoted input converts byte-identically."""
+
+    def test_quoted_input_converts_identically(self):
+        import csv as _csv
+        import io
+        plain = flex_csv(crtt_rows=BASE_CRTT, trnt_rows=[
+            "acct,acct,,USD,1,STK,COMMON,XYZ,XYZ CORP,20261020,"
+            "ExchTrade,7,26.73,-187.11,-0.34257825,,BUY,,0"])
+        out = io.StringIO()
+        writer = _csv.writer(out, quoting=_csv.QUOTE_ALL,
+                             lineterminator="\n")
+        writer.writerows(_csv.reader(io.StringIO(plain)))
+        quoted = out.getvalue()
+        self.assertTrue(quoted.startswith('"HEADER","CRTT",'))
+        plain_text, plain_warnings = flex_convert.convert(
+            plain, "20261001", "20261026")
+        quoted_text, quoted_warnings = flex_convert.convert(
+            quoted, "20261001", "20261026")
+        self.assertEqual(quoted_warnings, plain_warnings)
+        self.assertEqual(quoted_text, plain_text)
+
+
 class TradeTests(unittest.TestCase):
     def test_option_trade_and_float_artefact_net(self):
         # Net must be the float sum, artefact included, exactly

@@ -55,7 +55,7 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-FLEX_PULL_VERSION = "0.2.7"
+FLEX_PULL_VERSION = "0.2.8"
 FLEX_BASE = ("https://ndcdyn.interactivebrokers.com"
              "/Universal/servlet/FlexStatementService")
 # IBKR error 1019: statement generation in progress — retryable.
@@ -125,7 +125,9 @@ def parse_flex_xml(text: str) -> dict:
 def looks_like_statement(text: str) -> bool:
     stripped = text.lstrip("\ufeff \t\r\n")
     return (stripped.startswith("Statement,")
-            or "Transaction History,Header" in text)
+            or stripped.startswith('"Statement",')
+            or "Transaction History,Header" in text
+            or '"Transaction History","Header"' in text)
 
 
 def looks_like_flex_csv(text: str) -> bool:
@@ -135,9 +137,24 @@ def looks_like_flex_csv(text: str) -> bool:
     successful first-poll download for an XML error envelope
     and failed the run on its parse error (live 2026-10-28
     06:45; the error text is byte-identical to feeding the CSV
-    to the XML parser)."""
+    to the XML parser).
+
+    Live bodies are FULLY QUOTED ("HEADER","CRTT",...) — the
+    fixtures were not, and up to 0.2.7 this check only matched
+    the unquoted prefix. Four good morning statements (28-31
+    Oct 2026) fell through to the XML parser, were logged as
+    "unparseable" and burned the full 1800s poll budget before
+    the run failed. The first line is therefore parsed as CSV:
+    its first field must be exactly HEADER, quoted or not."""
     stripped = text.lstrip("\ufeff \t\r\n")
-    return stripped.startswith("HEADER,")
+    if stripped.startswith("HEADER,") or stripped.startswith('"HEADER",'):
+        return True
+    first = stripped.split("\n", 1)[0] if stripped else ""
+    try:
+        row = next(csv.reader(io.StringIO(first)))
+    except (csv.Error, StopIteration):
+        return False
+    return bool(row) and row[0] == "HEADER"
 
 
 def validate_statement(csv_text: str) -> dict:

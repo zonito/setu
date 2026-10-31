@@ -354,6 +354,20 @@ ACTIVITY_CSV = (
     "HEADER,TRNT,ClientAccountID\n")
 
 
+# The live wire shape (flex-pull.log 2026-10-30/31, from the
+# failure-line excerpt of the saved poll bodies): every field
+# quoted. The unquoted fixtures above never exercised it, so
+# up to 0.2.7 looks_like_flex_csv missed it and four good
+# statements were polled for 1800s as "unparseable".
+QUOTED_ACTIVITY_CSV = (
+    '"HEADER","CRTT","ClientAccountID","AccountAlias","Model",'
+    '"CurrencyPrimary","LevelOfDetail","FromDate","ToDate",'
+    '"StartingCash","EndingCash"\n'
+    '"DATA","CRTT","acct","zonito","","BASE_SUMMARY",'
+    '"BaseCurrency","20261001","20261026","1000","900"\n'
+    '"HEADER","TRNT","ClientAccountID"\n')
+
+
 class RawFlexCsvDownloadTests(unittest.TestCase):
     """A convert-mode download is the Activity envelope, not
     the statement envelope: the first GetStatement poll can
@@ -367,6 +381,51 @@ class RawFlexCsvDownloadTests(unittest.TestCase):
         body = client.fetch("1687614", date(2026, 10, 1),
                             date(2026, 10, 26))
         self.assertEqual(body, ACTIVITY_CSV)
+
+    def test_first_poll_quoted_activity_csv_is_returned(self):
+        # The 30/31 Oct 2026 live shape: SendRequest succeeds
+        # and the statement is already there at the first poll,
+        # fully quoted.
+        opener = _FakeOpener([SEND_OK, QUOTED_ACTIVITY_CSV])
+        client = flex_pull.FlexClient("TOK999", opener=opener,
+                                      sleeper=lambda s: None)
+        body = client.fetch("1687614", date(2026, 10, 1),
+                            date(2026, 10, 26))
+        self.assertEqual(body, QUOTED_ACTIVITY_CSV)
+
+    def test_quoted_activity_csv_after_1019_is_returned(self):
+        # The 29 Oct 2026 live shape: one clean 1019, then the
+        # quoted statement at the next poll.
+        opener = _FakeOpener([SEND_OK, GENERATING,
+                              QUOTED_ACTIVITY_CSV])
+        client = flex_pull.FlexClient("TOK999", opener=opener,
+                                      sleeper=lambda s: None)
+        body = client.fetch("1687614", date(2026, 10, 1),
+                            date(2026, 10, 26))
+        self.assertEqual(body, QUOTED_ACTIVITY_CSV)
+
+
+class LooksLikeFlexCsvTests(unittest.TestCase):
+    def test_unquoted_envelope(self):
+        self.assertTrue(flex_pull.looks_like_flex_csv(ACTIVITY_CSV))
+
+    def test_quoted_envelope(self):
+        self.assertTrue(
+            flex_pull.looks_like_flex_csv(QUOTED_ACTIVITY_CSV))
+
+    def test_quoted_envelope_with_bom_and_whitespace(self):
+        self.assertTrue(flex_pull.looks_like_flex_csv(
+            "\ufeff \n" + QUOTED_ACTIVITY_CSV))
+
+    def test_xml_envelope_is_not_csv(self):
+        self.assertFalse(flex_pull.looks_like_flex_csv(SEND_OK))
+
+    def test_html_junk_is_not_csv(self):
+        self.assertFalse(flex_pull.looks_like_flex_csv(
+            "<html><body>Service unavailable</body></html>"))
+
+    def test_empty_body_is_not_csv(self):
+        self.assertFalse(flex_pull.looks_like_flex_csv(""))
 
 
 class SendRetryTests(unittest.TestCase):
